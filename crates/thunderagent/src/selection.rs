@@ -55,7 +55,7 @@ impl WorkerScorer for ThunderAgentScorer {
     }
 }
 
-/// Preserves the queue policy's session assignment, then falls back to minimum score.
+/// Preserves the admission policy's session assignment, then falls back to minimum score.
 pub(crate) struct ThunderAgentPicker {
     assignments: Arc<SessionAssignments>,
 }

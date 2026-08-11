@@ -10,8 +10,8 @@ use crate::ThunderAgentConfig;
 use crate::selection::SessionAssignments;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::{
-    PolicyQueueDecision, PolicyQueueEvent, PolicyQueueId, PolicyQueuePolicy, PolicyQueueRequest,
-    PolicyQueueWorker,
+    QueueAdmissionDecision, QueueAdmissionEvent, QueueAdmissionId, QueueAdmissionPolicy,
+    QueueAdmissionRequest, QueueAdmissionWorker,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,8 +64,8 @@ struct RequestState {
 
 #[derive(Default)]
 struct SessionRequests {
-    current: Option<PolicyQueueId>,
-    waiting: VecDeque<PolicyQueueId>,
+    current: Option<QueueAdmissionId>,
+    waiting: VecDeque<QueueAdmissionId>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,8 +97,8 @@ pub(crate) struct ThunderAgentPolicy {
     config: ThunderAgentConfig,
     programs: HashMap<String, Program>,
     paused: HashSet<String>,
-    requests: HashMap<PolicyQueueId, RequestState>,
-    request_ids: HashMap<String, PolicyQueueId>,
+    requests: HashMap<QueueAdmissionId, RequestState>,
+    request_ids: HashMap<String, QueueAdmissionId>,
     sessions: HashMap<String, SessionRequests>,
     workers: HashMap<WorkerWithDpRank, WorkerState>,
     assignments: Arc<SessionAssignments>,
@@ -121,19 +121,19 @@ impl ThunderAgentPolicy {
         }
     }
 
-    fn admit_request(&mut self, request: PolicyQueueRequest<'_>) -> PolicyQueueDecision {
+    fn admit_request(&mut self, request: QueueAdmissionRequest<'_>) -> QueueAdmissionDecision {
         let Some(session_id) = request
             .session_context()
             .map(|context| context.session_id())
         else {
-            return PolicyQueueDecision::Bypass;
+            return QueueAdmissionDecision::Bypass;
         };
         if self.request_ids.contains_key(request.request_id()) {
             tracing::warn!(
                 request_id = request.request_id(),
                 "Duplicate active request ID"
             );
-            return PolicyQueueDecision::Bypass;
+            return QueueAdmissionDecision::Bypass;
         }
 
         self.update_workers(request.workers());
@@ -152,7 +152,7 @@ impl ThunderAgentPolicy {
                     .workers()
                     .iter()
                     .filter(|worker| worker.is_eligible())
-                    .map(PolicyQueueWorker::worker)
+                    .map(QueueAdmissionWorker::worker)
                     .collect(),
                 dispatched: false,
                 prior: None,
@@ -165,15 +165,15 @@ impl ThunderAgentPolicy {
                 .expect("busy session exists")
                 .waiting
                 .push_back(id);
-            return PolicyQueueDecision::Defer;
+            return QueueAdmissionDecision::Defer;
         }
 
         self.begin_request(id, Instant::now())
     }
 
-    fn begin_request(&mut self, id: PolicyQueueId, now: Instant) -> PolicyQueueDecision {
+    fn begin_request(&mut self, id: QueueAdmissionId, now: Instant) -> QueueAdmissionDecision {
         let Some(request) = self.requests.get(&id) else {
-            return PolicyQueueDecision::Defer;
+            return QueueAdmissionDecision::Defer;
         };
         let session_id = request.session_id.clone();
         let context_tokens = request.context_tokens;
@@ -204,16 +204,18 @@ impl ThunderAgentPolicy {
         let program = &self.programs[&session_id];
         if program.lifecycle == ProgramLifecycle::Paused {
             self.defer_request(&session_id, now, false);
-            return PolicyQueueDecision::Defer;
+            return QueueAdmissionDecision::Defer;
         }
         if let Some(worker) = program.assigned_worker
             && eligible_workers.contains(&worker)
         {
             match self.workers.get(&worker) {
-                Some(worker_state) if worker_state.available => return PolicyQueueDecision::Ready,
+                Some(worker_state) if worker_state.available => {
+                    return QueueAdmissionDecision::Ready;
+                }
                 Some(_) => {
                     self.defer_request(&session_id, now, true);
-                    return PolicyQueueDecision::Defer;
+                    return QueueAdmissionDecision::Defer;
                 }
                 None => self.set_assignment(&session_id, None),
             }
@@ -223,7 +225,7 @@ impl ThunderAgentPolicy {
 
         if was_new && !self.paused.is_empty() {
             self.defer_request(&session_id, now, false);
-            return PolicyQueueDecision::Defer;
+            return QueueAdmissionDecision::Defer;
         }
 
         let capacities: Vec<_> = self
@@ -232,7 +234,7 @@ impl ThunderAgentPolicy {
             .filter(|(worker, _)| eligible_workers.contains(worker))
             .collect();
         if capacities.is_empty() {
-            return PolicyQueueDecision::Ready;
+            return QueueAdmissionDecision::Ready;
         }
         let required = context_tokens.saturating_add(self.config.buffer_per_program);
         let usage = self.worker_usage(now);
@@ -250,11 +252,11 @@ impl ThunderAgentPolicy {
         match selected {
             Some(worker) => {
                 self.set_assignment(&session_id, Some(worker));
-                PolicyQueueDecision::Ready
+                QueueAdmissionDecision::Ready
             }
             None => {
                 self.defer_request(&session_id, now, false);
-                PolicyQueueDecision::Defer
+                QueueAdmissionDecision::Defer
             }
         }
     }
@@ -271,7 +273,7 @@ impl ThunderAgentPolicy {
         self.paused.insert(session_id.to_owned());
     }
 
-    fn dispatched(&mut self, id: PolicyQueueId, worker: WorkerWithDpRank) {
+    fn dispatched(&mut self, id: QueueAdmissionId, worker: WorkerWithDpRank) {
         let Some(request) = self.requests.get_mut(&id) else {
             return;
         };
@@ -293,7 +295,7 @@ impl ThunderAgentPolicy {
         request_id: &str,
         completed: bool,
         context_tokens: Option<usize>,
-    ) -> Vec<PolicyQueueId> {
+    ) -> Vec<QueueAdmissionId> {
         let Some(id) = self.request_ids.remove(request_id) else {
             return Vec::new();
         };
@@ -302,10 +304,10 @@ impl ThunderAgentPolicy {
 
     fn finish_request(
         &mut self,
-        id: PolicyQueueId,
+        id: QueueAdmissionId,
         completed: bool,
         context_tokens: Option<usize>,
-    ) -> Vec<PolicyQueueId> {
+    ) -> Vec<QueueAdmissionId> {
         let Some(request) = self.requests.remove(&id) else {
             return Vec::new();
         };
@@ -361,7 +363,7 @@ impl ThunderAgentPolicy {
         self.promote_next(&request.session_id)
     }
 
-    fn promote_next(&mut self, session_id: &str) -> Vec<PolicyQueueId> {
+    fn promote_next(&mut self, session_id: &str) -> Vec<QueueAdmissionId> {
         let next = self
             .sessions
             .get_mut(session_id)
@@ -371,12 +373,12 @@ impl ThunderAgentPolicy {
             return Vec::new();
         };
         match self.begin_request(id, Instant::now()) {
-            PolicyQueueDecision::Ready => vec![id],
+            QueueAdmissionDecision::Ready => vec![id],
             _ => Vec::new(),
         }
     }
 
-    fn reconcile(&mut self, workers: &[PolicyQueueWorker]) -> Vec<PolicyQueueId> {
+    fn reconcile(&mut self, workers: &[QueueAdmissionWorker]) -> Vec<QueueAdmissionId> {
         self.update_workers(workers);
         let now = Instant::now();
         if now < self.next_tick {
@@ -391,7 +393,7 @@ impl ThunderAgentPolicy {
         ready
     }
 
-    fn update_workers(&mut self, workers: &[PolicyQueueWorker]) {
+    fn update_workers(&mut self, workers: &[QueueAdmissionWorker]) {
         self.workers.clear();
         self.workers.extend(workers.iter().map(|worker| {
             (
@@ -492,7 +494,7 @@ impl ThunderAgentPolicy {
         &mut self,
         usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
         now: Instant,
-    ) -> Vec<PolicyQueueId> {
+    ) -> Vec<QueueAdmissionId> {
         let ceiling = (self.config.pause_threshold - self.config.resume_hysteresis).max(0.0);
         let mut capacities: Vec<(WorkerWithDpRank, usize)> = self
             .available_capacities()
@@ -555,7 +557,7 @@ impl ThunderAgentPolicy {
         &mut self,
         usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
         now: Instant,
-    ) -> Vec<PolicyQueueId> {
+    ) -> Vec<QueueAdmissionId> {
         let timeout = Duration::from_secs_f64(self.config.resume_timeout_seconds);
         let timed_out: Vec<String> = self
             .paused
@@ -688,7 +690,7 @@ impl ThunderAgentPolicy {
         &mut self,
         session_id: &str,
         worker: Option<WorkerWithDpRank>,
-    ) -> Vec<PolicyQueueId> {
+    ) -> Vec<QueueAdmissionId> {
         let deferred_id = self
             .sessions
             .get(session_id)
@@ -710,24 +712,24 @@ impl ThunderAgentPolicy {
     }
 }
 
-impl PolicyQueuePolicy for ThunderAgentPolicy {
-    fn admit(&mut self, request: PolicyQueueRequest<'_>) -> PolicyQueueDecision {
+impl QueueAdmissionPolicy for ThunderAgentPolicy {
+    fn admit(&mut self, request: QueueAdmissionRequest<'_>) -> QueueAdmissionDecision {
         self.admit_request(request)
     }
 
-    fn on_event(&mut self, event: PolicyQueueEvent<'_>, ready: &mut Vec<PolicyQueueId>) {
+    fn on_event(&mut self, event: QueueAdmissionEvent<'_>, ready: &mut Vec<QueueAdmissionId>) {
         match event {
-            PolicyQueueEvent::Dispatched { id, worker } => self.dispatched(id, worker),
-            PolicyQueueEvent::Completed {
+            QueueAdmissionEvent::Dispatched { id, worker } => self.dispatched(id, worker),
+            QueueAdmissionEvent::Completed {
                 request_id,
                 context_tokens,
             } => {
                 ready.extend(self.finish_by_request_id(request_id, true, context_tokens));
             }
-            PolicyQueueEvent::Aborted { request_id } => {
+            QueueAdmissionEvent::Aborted { request_id } => {
                 ready.extend(self.finish_by_request_id(request_id, false, None));
             }
-            PolicyQueueEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
+            QueueAdmissionEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
             _ => {}
         }
     }
@@ -753,8 +755,8 @@ mod tests {
 
     use super::*;
 
-    fn worker(id: u64, capacity: usize) -> PolicyQueueWorker {
-        PolicyQueueWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
+    fn worker(id: u64, capacity: usize) -> QueueAdmissionWorker {
+        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
     }
 
     fn context(session_id: &str) -> SessionContext {
@@ -765,10 +767,16 @@ mod tests {
         id: u64,
         request_id: &'a str,
         session: Option<&'a SessionContext>,
-        workers: &'a [PolicyQueueWorker],
+        workers: &'a [QueueAdmissionWorker],
         tokens: usize,
-    ) -> PolicyQueueRequest<'a> {
-        PolicyQueueRequest::new(PolicyQueueId::new(id), request_id, tokens, session, workers)
+    ) -> QueueAdmissionRequest<'a> {
+        QueueAdmissionRequest::new(
+            QueueAdmissionId::new(id),
+            request_id,
+            tokens,
+            session,
+            workers,
+        )
     }
 
     fn policy(config: ThunderAgentConfig) -> ThunderAgentPolicy {
@@ -782,28 +790,28 @@ mod tests {
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         assert_eq!(
             policy.admit(request(2, "request-2", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Defer
+            QueueAdmissionDecision::Defer
         );
         policy.on_event(
-            PolicyQueueEvent::Dispatched {
-                id: PolicyQueueId::new(1),
+            QueueAdmissionEvent::Dispatched {
+                id: QueueAdmissionId::new(1),
                 worker: WorkerWithDpRank::new(1, 0),
             },
             &mut Vec::new(),
         );
         let mut ready = Vec::new();
         policy.on_event(
-            PolicyQueueEvent::Completed {
+            QueueAdmissionEvent::Completed {
                 request_id: "request-1",
                 context_tokens: Some(150),
             },
             &mut ready,
         );
-        assert_eq!(ready, [PolicyQueueId::new(2)]);
+        assert_eq!(ready, [QueueAdmissionId::new(2)]);
     }
 
     #[test]
@@ -817,18 +825,18 @@ mod tests {
         });
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&first), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         assert_eq!(
             policy.admit(request(2, "request-2", Some(&second), &workers, 100)),
-            PolicyQueueDecision::Defer
+            QueueAdmissionDecision::Defer
         );
     }
 
     #[test]
     fn admission_ignores_request_ineligible_workers() {
         let workers = [
-            PolicyQueueWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
+            QueueAdmissionWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
             worker(2, 1_000),
         ];
         let session = context("session-a");
@@ -836,7 +844,7 @@ mod tests {
 
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         assert_eq!(
             policy.programs["session-a"].assigned_worker,
@@ -851,10 +859,10 @@ mod tests {
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         policy.on_event(
-            PolicyQueueEvent::Aborted {
+            QueueAdmissionEvent::Aborted {
                 request_id: "request-1",
             },
             &mut Vec::new(),
@@ -868,7 +876,7 @@ mod tests {
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", None, &workers, 100)),
-            PolicyQueueDecision::Bypass
+            QueueAdmissionDecision::Bypass
         );
         assert!(policy.programs.is_empty());
         assert!(policy.requests.is_empty());
@@ -886,17 +894,20 @@ mod tests {
         });
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&first), &small, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         assert_eq!(
             policy.admit(request(2, "request-2", Some(&second), &small, 100)),
-            PolicyQueueDecision::Defer
+            QueueAdmissionDecision::Defer
         );
 
         policy.next_tick = Instant::now();
         let mut ready = Vec::new();
-        policy.on_event(PolicyQueueEvent::Reconcile { workers: &large }, &mut ready);
-        assert_eq!(ready, [PolicyQueueId::new(2)]);
+        policy.on_event(
+            QueueAdmissionEvent::Reconcile { workers: &large },
+            &mut ready,
+        );
+        assert_eq!(ready, [QueueAdmissionId::new(2)]);
         assert_eq!(
             policy.programs["session-b"].assigned_worker,
             Some(WorkerWithDpRank::new(1, 0))
@@ -910,17 +921,17 @@ mod tests {
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         policy.on_event(
-            PolicyQueueEvent::Dispatched {
-                id: PolicyQueueId::new(1),
+            QueueAdmissionEvent::Dispatched {
+                id: QueueAdmissionId::new(1),
                 worker: WorkerWithDpRank::new(2, 0),
             },
             &mut Vec::new(),
         );
         policy.on_event(
-            PolicyQueueEvent::Completed {
+            QueueAdmissionEvent::Completed {
                 request_id: "request-1",
                 context_tokens: Some(150),
             },
@@ -929,7 +940,7 @@ mod tests {
         assert_eq!(policy.programs["session-a"].token_total, 150);
         assert_eq!(
             policy.admit(request(2, "request-2", Some(&session), &workers, 100)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         assert_eq!(
             policy.programs["session-a"].assigned_worker,
@@ -948,17 +959,17 @@ mod tests {
         });
         assert_eq!(
             policy.admit(request(1, "request-1", Some(&session), &constrained, 400,)),
-            PolicyQueueDecision::Ready
+            QueueAdmissionDecision::Ready
         );
         policy.on_event(
-            PolicyQueueEvent::Dispatched {
-                id: PolicyQueueId::new(1),
+            QueueAdmissionEvent::Dispatched {
+                id: QueueAdmissionId::new(1),
                 worker: WorkerWithDpRank::new(1, 0),
             },
             &mut Vec::new(),
         );
         policy.on_event(
-            PolicyQueueEvent::Completed {
+            QueueAdmissionEvent::Completed {
                 request_id: "request-1",
                 context_tokens: Some(400),
             },
@@ -967,7 +978,7 @@ mod tests {
 
         policy.next_tick = Instant::now();
         policy.on_event(
-            PolicyQueueEvent::Reconcile {
+            QueueAdmissionEvent::Reconcile {
                 workers: &constrained,
             },
             &mut Vec::new(),
@@ -979,7 +990,7 @@ mod tests {
 
         policy.next_tick = Instant::now();
         policy.on_event(
-            PolicyQueueEvent::Reconcile { workers: &expanded },
+            QueueAdmissionEvent::Reconcile { workers: &expanded },
             &mut Vec::new(),
         );
         assert_eq!(

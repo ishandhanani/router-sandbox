@@ -21,9 +21,9 @@ let factory: WorkerSelectionPolicyFactory = Arc::new(move |router, worker_type, 
 
 The returned `WorkerSelectionPolicy` contains all three external components:
 
-- A queue admission policy that owns program, session, request, and capacity state.
+- A `QueueAdmissionPolicy` that implements session fairness by controlling which requests become runnable.
 - A scorer used only when no session assignment exists.
-- A picker that honors the queue policy's session assignment when that worker remains eligible.
+- A picker that honors the admission policy's session assignment when that worker remains eligible.
 
 Requests without Dynamo session context bypass ThunderAgent admission and still use the scorer and picker.
 
@@ -31,4 +31,4 @@ The crate also exposes `register`, so it can be linked directly as Dynamo's `dyn
 
 [`worker-selection.yaml`](crates/thunderagent/worker-selection.yaml) is a complete policy configuration using the default ThunderAgent values.
 
-This prototype depends on the Dynamo queue-policy seam in [ai-dynamo/dynamo#13019](https://github.com/ai-dynamo/dynamo/pull/13019).
+Runnable ordering remains Dynamo-owned. This prototype depends on the Dynamo queue-admission seam in [ai-dynamo/dynamo#13019](https://github.com/ai-dynamo/dynamo/pull/13019).

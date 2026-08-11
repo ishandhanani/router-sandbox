@@ -46,7 +46,7 @@ fn validated_policy(
         vec![Box::new(scorer)],
         Box::new(picker),
     )
-    .with_queue_policy(Box::new(admission))
+    .with_admission_policy(Box::new(admission))
 }
 
 fn provider(
