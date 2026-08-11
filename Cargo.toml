@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "ThunderAgent session-aware admission and routing policy for Dynamo"
-repository = "https://github.com/ThunderAgents-ai/ThunderAgent"
+repository = "https://github.com/ishandhanani/router-sandbox"
 
 [dependencies]
 dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["standalone-selection"] }
