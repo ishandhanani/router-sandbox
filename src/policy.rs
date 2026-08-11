@@ -57,6 +57,7 @@ struct RequestState {
     request_id: String,
     session_id: String,
     context_tokens: usize,
+    eligible_workers: HashSet<WorkerWithDpRank>,
     dispatched: bool,
     prior: Option<Program>,
 }
@@ -147,6 +148,12 @@ impl ThunderAgentPolicy {
                 request_id: request.request_id().to_owned(),
                 session_id: session_id.to_owned(),
                 context_tokens: request.context_tokens(),
+                eligible_workers: request
+                    .workers()
+                    .iter()
+                    .filter(|worker| worker.is_eligible())
+                    .map(PolicyQueueWorker::worker)
+                    .collect(),
                 dispatched: false,
                 prior: None,
             },
@@ -170,6 +177,7 @@ impl ThunderAgentPolicy {
         };
         let session_id = request.session_id.clone();
         let context_tokens = request.context_tokens;
+        let eligible_workers = request.eligible_workers.clone();
         let prior = self.programs.get(&session_id).cloned();
         let was_new = prior.is_none();
         self.requests.get_mut(&id).expect("request exists").prior = prior;
@@ -198,7 +206,9 @@ impl ThunderAgentPolicy {
             self.defer_request(&session_id, now, false);
             return PolicyQueueDecision::Defer;
         }
-        if let Some(worker) = program.assigned_worker {
+        if let Some(worker) = program.assigned_worker
+            && eligible_workers.contains(&worker)
+        {
             match self.workers.get(&worker) {
                 Some(worker_state) if worker_state.available => return PolicyQueueDecision::Ready,
                 Some(_) => {
@@ -207,6 +217,8 @@ impl ThunderAgentPolicy {
                 }
                 None => self.set_assignment(&session_id, None),
             }
+        } else if program.assigned_worker.is_some() {
+            self.set_assignment(&session_id, None);
         }
 
         if was_new && !self.paused.is_empty() {
@@ -214,7 +226,11 @@ impl ThunderAgentPolicy {
             return PolicyQueueDecision::Defer;
         }
 
-        let capacities = self.available_capacities();
+        let capacities: Vec<_> = self
+            .available_capacities()
+            .into_iter()
+            .filter(|(worker, _)| eligible_workers.contains(worker))
+            .collect();
         if capacities.is_empty() {
             return PolicyQueueDecision::Ready;
         }
@@ -508,8 +524,16 @@ impl ThunderAgentPolicy {
                 .token_total
                 .saturating_add(self.config.buffer_per_program);
             let assigned = self.programs[&session_id].assigned_worker;
+            let eligible = self
+                .sessions
+                .get(&session_id)
+                .and_then(|requests| requests.current)
+                .and_then(|id| self.requests.get(&id))
+                .map(|request| &request.eligible_workers);
             let Some(position) = capacities.iter().position(|(worker, remaining)| {
-                assigned.is_none_or(|assigned| assigned == *worker) && required <= *remaining
+                eligible.is_none_or(|eligible| eligible.contains(worker))
+                    && assigned.is_none_or(|assigned| assigned == *worker)
+                    && required <= *remaining
             }) else {
                 continue;
             };
@@ -545,13 +569,21 @@ impl ThunderAgentPolicy {
             .cloned()
             .collect();
         let capacities = self.available_capacities();
-        let any_available = self.workers.values().any(|worker| worker.available);
         let mut ready = Vec::new();
         for session_id in timed_out {
             let assigned = self.programs[&session_id].assigned_worker;
+            let eligible = self
+                .sessions
+                .get(&session_id)
+                .and_then(|requests| requests.current)
+                .and_then(|id| self.requests.get(&id))
+                .map(|request| &request.eligible_workers);
             let target = capacities
                 .iter()
-                .filter(|(worker, _)| assigned.is_none_or(|assigned| assigned == *worker))
+                .filter(|(worker, _)| {
+                    eligible.is_none_or(|eligible| eligible.contains(worker))
+                        && assigned.is_none_or(|assigned| assigned == *worker)
+                })
                 .max_by_key(|(worker, capacity)| {
                     (
                         *capacity as i128
@@ -560,6 +592,9 @@ impl ThunderAgentPolicy {
                     )
                 })
                 .map(|(worker, _)| *worker);
+            let any_available = self.workers.iter().any(|(worker, state)| {
+                state.available && eligible.is_none_or(|eligible| eligible.contains(worker))
+            });
             if target.is_none() && !any_available {
                 continue;
             }
@@ -696,6 +731,12 @@ impl PolicyQueuePolicy for ThunderAgentPolicy {
             _ => {}
         }
     }
+
+    fn reconcile_interval(&self) -> Option<Duration> {
+        Some(Duration::from_secs_f64(
+            self.config.scheduler_interval_seconds,
+        ))
+    }
 }
 
 fn scale_tokens(tokens: usize, factor: f64) -> usize {
@@ -713,7 +754,7 @@ mod tests {
     use super::*;
 
     fn worker(id: u64, capacity: usize) -> PolicyQueueWorker {
-        PolicyQueueWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true)
+        PolicyQueueWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
     }
 
     fn context(session_id: &str) -> SessionContext {
@@ -781,6 +822,25 @@ mod tests {
         assert_eq!(
             policy.admit(request(2, "request-2", Some(&second), &workers, 100)),
             PolicyQueueDecision::Defer
+        );
+    }
+
+    #[test]
+    fn admission_ignores_request_ineligible_workers() {
+        let workers = [
+            PolicyQueueWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
+            worker(2, 1_000),
+        ];
+        let session = context("session-a");
+        let mut policy = policy(Default::default());
+
+        assert_eq!(
+            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
+            PolicyQueueDecision::Ready
+        );
+        assert_eq!(
+            policy.programs["session-a"].assigned_worker,
+            Some(WorkerWithDpRank::new(2, 0))
         );
     }
 
