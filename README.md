@@ -1,6 +1,10 @@
-# ThunderAgent Dynamo strategy
+# Router sandbox
 
-This crate keeps ThunderAgent's session and capacity state outside Dynamo. Dynamo owns request storage and calls the policy serially from its queue actor.
+This Cargo workspace contains external routing strategies for Dynamo.
+
+## ThunderAgent
+
+The [`thunderagent-dynamo-policy`](crates/thunderagent) crate keeps ThunderAgent's session and capacity state outside Dynamo. Dynamo owns request storage and calls the policy serially from its queue actor.
 
 ```rust
 use std::sync::Arc;
@@ -25,6 +29,6 @@ Requests without Dynamo session context bypass ThunderAgent admission and still 
 
 The crate also exposes `register`, so it can be linked directly as Dynamo's `dynamo-worker-selection-policy-catalog` dependency. The registered policy type is `thunderagent`; its YAML parameters are the fields of `ThunderAgentConfig`.
 
-[`worker-selection.yaml`](worker-selection.yaml) is a complete policy configuration using the default ThunderAgent values.
+[`worker-selection.yaml`](crates/thunderagent/worker-selection.yaml) is a complete policy configuration using the default ThunderAgent values.
 
 This prototype depends on the Dynamo queue-policy seam in [ai-dynamo/dynamo#13019](https://github.com/ai-dynamo/dynamo/pull/13019).
