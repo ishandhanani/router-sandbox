@@ -130,7 +130,7 @@ impl WorkerPicker for ThunderAgentPicker {
         };
         let assigned_worker = self.assignments.get(session.session_id());
         match session.input_trigger() {
-            Some(WorkerSelectionInputTrigger::ToolResult)
+            Some(WorkerSelectionInputTrigger::UserMessage)
                 if assigned_worker == Some(selected_worker) =>
             {
                 Ok(vec![KvHintAction::demote(
