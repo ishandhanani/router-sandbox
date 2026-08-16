@@ -48,7 +48,7 @@ fn validated_policy(
     let picker = ThunderAgentPicker::new(assignments, storage_handoff_experiment);
     WorkerSelectionPolicy::new(
         kv_router_config,
-        worker_type,
+        worker_type.as_str(),
         vec![Box::new(scorer)],
         Box::new(picker),
     )
