@@ -14,7 +14,7 @@ use dynamo_kv_router::services::selection::{
     WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
     WorkerSelectionPolicyRegistryError,
 };
-use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy};
+use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy, WorkerType};
 
 use selection::SessionAssignments;
 use selection::{ThunderAgentPicker, ThunderAgentScorer};
@@ -24,7 +24,7 @@ use policy::ThunderAgentPolicy;
 /// Build one complete ThunderAgent policy for a Dynamo routing partition.
 pub fn worker_selection_policy(
     kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
+    worker_type: WorkerType,
     config: ThunderAgentConfig,
 ) -> Result<WorkerSelectionPolicy, ConfigError> {
     config.validate()?;
@@ -38,7 +38,7 @@ pub fn worker_selection_policy(
 
 fn validated_policy(
     kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
+    worker_type: WorkerType,
     config: ThunderAgentConfig,
     storage_handoff_experiment: bool,
 ) -> WorkerSelectionPolicy {

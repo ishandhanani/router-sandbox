@@ -148,12 +148,13 @@ impl ThunderAgentPolicy {
                 request_id: request.request_id().to_owned(),
                 session_id: session_id.to_owned(),
                 context_tokens: request.context_tokens(),
-                eligible_workers: request
-                    .workers()
-                    .iter()
-                    .filter(|worker| worker.is_eligible())
-                    .map(QueueAdmissionWorker::worker)
-                    .collect(),
+                eligible_workers: {
+                    let mut workers = HashSet::new();
+                    request.for_each_eligible_worker(|worker| {
+                        workers.insert(worker.worker());
+                    });
+                    workers
+                },
                 dispatched: false,
                 prior: None,
             },
@@ -729,7 +730,9 @@ impl QueueAdmissionPolicy for ThunderAgentPolicy {
             QueueAdmissionEvent::Aborted { request_id } => {
                 ready.extend(self.finish_by_request_id(request_id, false, None));
             }
-            QueueAdmissionEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
+            QueueAdmissionEvent::Reconcile { snapshot } => {
+                ready.extend(self.reconcile(snapshot.workers()));
+            }
             _ => {}
         }
     }
