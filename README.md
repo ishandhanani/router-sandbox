@@ -29,6 +29,8 @@ Requests without Dynamo session context bypass ThunderAgent admission and still 
 
 The crate also exposes `register`, so it can be linked directly as Dynamo's `dynamo-worker-selection-policy-catalog` dependency. The registered policy type is `thunderagent`; its YAML parameters are the fields of `ThunderAgentConfig`.
 
+For isolated cache-storage validation, the catalog also exposes `thunderagent-storage-handoff-experiment`. It keeps ThunderAgent admission unchanged. A tool-result request stays on the assigned worker and emits `kv.demote`; the next `Other` request moves to an eligible alternate worker and emits `kv.prefetch`. This policy type is for an end-to-end storage-hint run only.
+
 [`worker-selection.yaml`](crates/thunderagent/worker-selection.yaml) is a complete policy configuration using the default ThunderAgent values.
 
 Runnable ordering remains Dynamo-owned. This prototype depends on the Dynamo queue-admission seam in [ai-dynamo/dynamo#13019](https://github.com/ai-dynamo/dynamo/pull/13019).

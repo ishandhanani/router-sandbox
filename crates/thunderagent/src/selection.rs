@@ -4,10 +4,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dynamo_kv_router::kv_hints::{KvDemotePayload, KvHintAction};
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::{
     WorkerCandidate, WorkerInputView, WorkerInputs, WorkerPicker, WorkerScorer,
-    WorkerSelectionContext, WorkerSelectionPolicyError,
+    WorkerSelectionContext, WorkerSelectionInputTrigger, WorkerSelectionPolicyError,
 };
 use parking_lot::RwLock;
 
@@ -58,11 +59,18 @@ impl WorkerScorer for ThunderAgentScorer {
 /// Preserves the admission policy's session assignment, then falls back to minimum score.
 pub(crate) struct ThunderAgentPicker {
     assignments: Arc<SessionAssignments>,
+    storage_handoff_experiment: bool,
 }
 
 impl ThunderAgentPicker {
-    pub(crate) fn new(assignments: Arc<SessionAssignments>) -> Self {
-        Self { assignments }
+    pub(crate) fn new(
+        assignments: Arc<SessionAssignments>,
+        storage_handoff_experiment: bool,
+    ) -> Self {
+        Self {
+            assignments,
+            storage_handoff_experiment,
+        }
     }
 }
 
@@ -73,9 +81,16 @@ impl WorkerPicker for ThunderAgentPicker {
         input: WorkerInputView<'_>,
     ) -> Result<usize, WorkerSelectionPolicyError> {
         let candidates = input.candidates();
-        if let Some(worker) = context
+        let assigned_worker = context
             .session_context()
-            .and_then(|session| self.assignments.get(session.session_id()))
+            .and_then(|session| self.assignments.get(session.session_id()));
+        let storage_handoff = self.storage_handoff_experiment
+            && context
+                .session_context()
+                .and_then(|session| session.input_trigger())
+                == Some(WorkerSelectionInputTrigger::Other);
+        if !storage_handoff
+            && let Some(worker) = assigned_worker
             && let Some(row) = candidates
                 .iter()
                 .position(|candidate| candidate.worker() == worker)
@@ -83,15 +98,59 @@ impl WorkerPicker for ThunderAgentPicker {
             return Ok(row);
         }
 
-        candidates
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                left.cost()
-                    .total_cmp(&right.cost())
-                    .then_with(|| left.worker().cmp(&right.worker()))
-            })
-            .map(|(row, _)| row)
+        let lowest_cost = |exclude_assigned: bool| {
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| {
+                    !exclude_assigned || Some(candidate.worker()) != assigned_worker
+                })
+                .min_by(|(_, left), (_, right)| {
+                    left.cost()
+                        .total_cmp(&right.cost())
+                        .then_with(|| left.worker().cmp(&right.worker()))
+                })
+                .map(|(row, _)| row)
+        };
+        lowest_cost(storage_handoff)
+            .or_else(|| lowest_cost(false))
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+    }
+
+    fn kv_hint_actions(
+        &mut self,
+        context: &WorkerSelectionContext<'_>,
+        selected_worker: WorkerWithDpRank,
+    ) -> Result<Vec<KvHintAction>, WorkerSelectionPolicyError> {
+        if !self.storage_handoff_experiment {
+            return Ok(Vec::new());
+        }
+        let Some(session) = context.session_context() else {
+            return Ok(Vec::new());
+        };
+        let assigned_worker = self.assignments.get(session.session_id());
+        match session.input_trigger() {
+            Some(WorkerSelectionInputTrigger::ToolResult)
+                if assigned_worker == Some(selected_worker) =>
+            {
+                Ok(vec![KvHintAction::demote(
+                    format!("thunderagent-demote-{}", session.session_id()),
+                    KvDemotePayload {
+                        session_id: session.session_id().to_owned(),
+                        session_generation: None,
+                    },
+                )])
+            }
+            Some(WorkerSelectionInputTrigger::Other)
+                if assigned_worker.is_some_and(|worker| worker != selected_worker) =>
+            {
+                Ok(vec![KvHintAction::prefetch(format!(
+                    "thunderagent-prefetch-{}-{}",
+                    session.session_id(),
+                    selected_worker.worker_id,
+                ))])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 }

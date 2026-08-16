@@ -28,18 +28,24 @@ pub fn worker_selection_policy(
     config: ThunderAgentConfig,
 ) -> Result<WorkerSelectionPolicy, ConfigError> {
     config.validate()?;
-    Ok(validated_policy(kv_router_config, worker_type, config))
+    Ok(validated_policy(
+        kv_router_config,
+        worker_type,
+        config,
+        false,
+    ))
 }
 
 fn validated_policy(
     kv_router_config: KvRouterConfig,
     worker_type: &'static str,
     config: ThunderAgentConfig,
+    storage_handoff_experiment: bool,
 ) -> WorkerSelectionPolicy {
     let assignments = Arc::new(SessionAssignments::default());
     let admission = ThunderAgentPolicy::new(config, Arc::clone(&assignments));
     let scorer = ThunderAgentScorer;
-    let picker = ThunderAgentPicker::new(assignments);
+    let picker = ThunderAgentPicker::new(assignments, storage_handoff_experiment);
     WorkerSelectionPolicy::new(
         kv_router_config,
         worker_type,
@@ -52,12 +58,30 @@ fn validated_policy(
 fn provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    provider_with_storage_handoff(parameters, false)
+}
+
+fn storage_handoff_provider(
+    parameters: &WorkerSelectionPolicyParameters,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    provider_with_storage_handoff(parameters, true)
+}
+
+fn provider_with_storage_handoff(
+    parameters: &WorkerSelectionPolicyParameters,
+    storage_handoff_experiment: bool,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
     let config: ThunderAgentConfig = parameters.deserialize()?;
     config
         .validate()
         .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
     Ok(Arc::new(move |router, worker_type, _partition| {
-        validated_policy(router.clone(), worker_type, config.clone())
+        validated_policy(
+            router.clone(),
+            worker_type,
+            config.clone(),
+            storage_handoff_experiment,
+        )
     }))
 }
 
@@ -65,7 +89,11 @@ fn provider(
 pub fn register(
     registry: &mut WorkerSelectionPolicyRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    registry.register("thunderagent", Arc::new(provider))
+    registry.register("thunderagent", Arc::new(provider))?;
+    registry.register(
+        "thunderagent-storage-handoff-experiment",
+        Arc::new(storage_handoff_provider),
+    )
 }
 
 #[cfg(test)]
