@@ -1,0 +1,11 @@
+worker_selection:
+  aggregated: sticky-until-saturated
+  prefill: sticky-until-saturated
+  decode: sticky-until-saturated
+  instances:
+    - name: sticky-until-saturated
+      type: sticky-until-saturated
+      parameters:
+        affinity_threshold: 0.8
+        peak_prefill_tokens_per_second: 15928.0
+        max_ttft_penalty_ms: 18000

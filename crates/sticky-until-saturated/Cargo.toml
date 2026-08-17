@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "sticky-until-saturated-dynamo-policy"
+description = "Sticky-until-saturated token-aware worker-selection policy for Dynamo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+bench = []
+
+[dependencies]
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "main", features = ["standalone-selection"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sticky_until_saturated"
+harness = false
+required-features = ["bench"]
