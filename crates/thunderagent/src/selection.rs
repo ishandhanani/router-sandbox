@@ -60,16 +60,19 @@ impl WorkerScorer for ThunderAgentScorer {
 pub(crate) struct ThunderAgentPicker {
     assignments: Arc<SessionAssignments>,
     storage_handoff_experiment: bool,
+    emit_prefetch: bool,
 }
 
 impl ThunderAgentPicker {
     pub(crate) fn new(
         assignments: Arc<SessionAssignments>,
         storage_handoff_experiment: bool,
+        emit_prefetch: bool,
     ) -> Self {
         Self {
             assignments,
             storage_handoff_experiment,
+            emit_prefetch,
         }
     }
 }
@@ -142,7 +145,8 @@ impl WorkerPicker for ThunderAgentPicker {
                 )])
             }
             Some(WorkerSelectionInputTrigger::Other)
-                if assigned_worker.is_some_and(|worker| worker != selected_worker) =>
+                if self.emit_prefetch
+                    && assigned_worker.is_some_and(|worker| worker != selected_worker) =>
             {
                 Ok(vec![KvHintAction::prefetch(format!(
                     "thunderagent-prefetch-{}-{}",

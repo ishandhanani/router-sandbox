@@ -33,6 +33,7 @@ pub fn worker_selection_policy(
         worker_type,
         config,
         false,
+        false,
     ))
 }
 
@@ -41,11 +42,12 @@ fn validated_policy(
     worker_type: WorkerType,
     config: ThunderAgentConfig,
     storage_handoff_experiment: bool,
+    emit_prefetch: bool,
 ) -> WorkerSelectionPolicy {
     let assignments = Arc::new(SessionAssignments::default());
     let admission = ThunderAgentPolicy::new(config, Arc::clone(&assignments));
     let scorer = ThunderAgentScorer;
-    let picker = ThunderAgentPicker::new(assignments, storage_handoff_experiment);
+    let picker = ThunderAgentPicker::new(assignments, storage_handoff_experiment, emit_prefetch);
     WorkerSelectionPolicy::new(
         kv_router_config,
         worker_type.as_str(),
@@ -58,18 +60,25 @@ fn validated_policy(
 fn provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    provider_with_storage_handoff(parameters, false)
+    provider_with_storage_handoff(parameters, false, false)
 }
 
 fn storage_handoff_provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    provider_with_storage_handoff(parameters, true)
+    provider_with_storage_handoff(parameters, true, true)
+}
+
+fn storage_handoff_without_prefetch_provider(
+    parameters: &WorkerSelectionPolicyParameters,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    provider_with_storage_handoff(parameters, true, false)
 }
 
 fn provider_with_storage_handoff(
     parameters: &WorkerSelectionPolicyParameters,
     storage_handoff_experiment: bool,
+    emit_prefetch: bool,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
     let config: ThunderAgentConfig = parameters.deserialize()?;
     config
@@ -81,6 +90,7 @@ fn provider_with_storage_handoff(
             worker_type,
             config.clone(),
             storage_handoff_experiment,
+            emit_prefetch,
         )
     }))
 }
@@ -93,6 +103,10 @@ pub fn register(
     registry.register(
         "thunderagent-storage-handoff-experiment",
         Arc::new(storage_handoff_provider),
+    )?;
+    registry.register(
+        "thunderagent-storage-handoff-no-prefetch-experiment",
+        Arc::new(storage_handoff_without_prefetch_provider),
     )
 }
 
