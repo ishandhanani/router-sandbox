@@ -12,3 +12,13 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+
+[dev-dependencies]
+criterion = "0.5"
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["bench", "standalone-selection"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-util = "0.7"
+
+[[bench]]
+name = "admission_overhead"
+harness = false

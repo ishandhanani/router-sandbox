@@ -11,7 +11,7 @@ use crate::selection::SessionAssignments;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::{
     QueueAdmissionDecision, QueueAdmissionEvent, QueueAdmissionId, QueueAdmissionPolicy,
-    QueueAdmissionRequest, QueueAdmissionWorker,
+    QueueAdmissionRequest, QueueAdmissionWorkerSnapshot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +101,7 @@ pub(crate) struct ThunderAgentPolicy {
     request_ids: HashMap<String, QueueAdmissionId>,
     sessions: HashMap<String, SessionRequests>,
     workers: HashMap<WorkerWithDpRank, WorkerState>,
+    worker_snapshot_generation: Option<u64>,
     assignments: Arc<SessionAssignments>,
     next_tick: Instant,
 }
@@ -116,6 +117,7 @@ impl ThunderAgentPolicy {
             request_ids: HashMap::new(),
             sessions: HashMap::new(),
             workers: HashMap::new(),
+            worker_snapshot_generation: None,
             assignments,
             next_tick,
         }
@@ -136,7 +138,7 @@ impl ThunderAgentPolicy {
             return QueueAdmissionDecision::Bypass;
         }
 
-        self.update_workers(request.workers());
+        self.update_workers(request.worker_snapshot());
         let id = request.id();
         let session_is_busy = self
             .sessions
@@ -148,12 +150,13 @@ impl ThunderAgentPolicy {
                 request_id: request.request_id().to_owned(),
                 session_id: session_id.to_owned(),
                 context_tokens: request.context_tokens(),
-                eligible_workers: request
-                    .workers()
-                    .iter()
-                    .filter(|worker| worker.is_eligible())
-                    .map(QueueAdmissionWorker::worker)
-                    .collect(),
+                eligible_workers: {
+                    let mut workers = HashSet::new();
+                    request.for_each_eligible_worker(|worker| {
+                        workers.insert(worker.worker());
+                    });
+                    workers
+                },
                 dispatched: false,
                 prior: None,
             },
@@ -228,10 +231,16 @@ impl ThunderAgentPolicy {
             return QueueAdmissionDecision::Defer;
         }
 
-        let capacities: Vec<_> = self
-            .available_capacities()
-            .into_iter()
-            .filter(|(worker, _)| eligible_workers.contains(worker))
+        let capacities: Vec<_> = eligible_workers
+            .iter()
+            .filter_map(|&worker| {
+                self.workers.get(&worker).and_then(|state| {
+                    (state.available)
+                        .then_some(state.capacity_tokens)
+                        .flatten()
+                        .map(|capacity| (worker, capacity))
+                })
+            })
             .collect();
         if capacities.is_empty() {
             return QueueAdmissionDecision::Ready;
@@ -378,8 +387,8 @@ impl ThunderAgentPolicy {
         }
     }
 
-    fn reconcile(&mut self, workers: &[QueueAdmissionWorker]) -> Vec<QueueAdmissionId> {
-        self.update_workers(workers);
+    fn reconcile(&mut self, snapshot: &QueueAdmissionWorkerSnapshot) -> Vec<QueueAdmissionId> {
+        self.update_workers(snapshot);
         let now = Instant::now();
         if now < self.next_tick {
             return Vec::new();
@@ -393,9 +402,12 @@ impl ThunderAgentPolicy {
         ready
     }
 
-    fn update_workers(&mut self, workers: &[QueueAdmissionWorker]) {
+    fn update_workers(&mut self, snapshot: &QueueAdmissionWorkerSnapshot) {
+        if self.worker_snapshot_generation == Some(snapshot.generation()) {
+            return;
+        }
         self.workers.clear();
-        self.workers.extend(workers.iter().map(|worker| {
+        self.workers.extend(snapshot.workers().iter().map(|worker| {
             (
                 worker.worker(),
                 WorkerState {
@@ -417,6 +429,7 @@ impl ThunderAgentPolicy {
         for session_id in removed {
             self.set_assignment(&session_id, None);
         }
+        self.worker_snapshot_generation = Some(snapshot.generation());
     }
 
     fn available_capacities(&self) -> Vec<(WorkerWithDpRank, usize)> {
@@ -729,7 +742,7 @@ impl QueueAdmissionPolicy for ThunderAgentPolicy {
             QueueAdmissionEvent::Aborted { request_id } => {
                 ready.extend(self.finish_by_request_id(request_id, false, None));
             }
-            QueueAdmissionEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
+            QueueAdmissionEvent::Reconcile { snapshot } => ready.extend(self.reconcile(snapshot)),
             _ => {}
         }
     }
@@ -751,12 +764,19 @@ fn sort_capacities(capacities: &mut [(WorkerWithDpRank, usize)]) {
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::SessionContext;
+    use dynamo_kv_router::{QueueAdmissionWorker, SessionContext};
 
     use super::*;
 
     fn worker(id: u64, capacity: usize) -> QueueAdmissionWorker {
-        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
+        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true)
+    }
+
+    fn snapshot(
+        generation: u64,
+        workers: Vec<QueueAdmissionWorker>,
+    ) -> QueueAdmissionWorkerSnapshot {
+        QueueAdmissionWorkerSnapshot::new(generation, workers)
     }
 
     fn context(session_id: &str) -> SessionContext {
@@ -767,7 +787,7 @@ mod tests {
         id: u64,
         request_id: &'a str,
         session: Option<&'a SessionContext>,
-        workers: &'a [QueueAdmissionWorker],
+        snapshot: &'a QueueAdmissionWorkerSnapshot,
         tokens: usize,
     ) -> QueueAdmissionRequest<'a> {
         QueueAdmissionRequest::new(
@@ -775,7 +795,7 @@ mod tests {
             request_id,
             tokens,
             session,
-            workers,
+            snapshot,
         )
     }
 
@@ -785,7 +805,7 @@ mod tests {
 
     #[test]
     fn serializes_requests_for_one_session() {
-        let workers = [worker(1, 1_000)];
+        let workers = snapshot(1, vec![worker(1, 1_000)]);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -816,7 +836,7 @@ mod tests {
 
     #[test]
     fn defers_when_program_capacity_is_exhausted() {
-        let workers = [worker(1, 250)];
+        let workers = snapshot(1, vec![worker(1, 250)]);
         let first = context("session-a");
         let second = context("session-b");
         let mut policy = policy(ThunderAgentConfig {
@@ -835,15 +855,16 @@ mod tests {
 
     #[test]
     fn admission_ignores_request_ineligible_workers() {
-        let workers = [
-            QueueAdmissionWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
-            worker(2, 1_000),
-        ];
+        let workers = snapshot(1, vec![worker(1, 1_000), worker(2, 1_000)]);
+        let eligible_workers = HashSet::from([WorkerWithDpRank::new(2, 0)]);
         let session = context("session-a");
         let mut policy = policy(Default::default());
 
         assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
+            policy.admit(
+                request(1, "request-1", Some(&session), &workers, 100)
+                    .with_eligible_workers(&eligible_workers)
+            ),
             QueueAdmissionDecision::Ready
         );
         assert_eq!(
@@ -853,8 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn reuses_worker_state_until_snapshot_generation_changes() {
+        let first = snapshot(1, vec![worker(1, 1_000)]);
+        let second = snapshot(2, vec![worker(1, 2_000)]);
+        let worker_rank = WorkerWithDpRank::new(1, 0);
+        let mut policy = policy(Default::default());
+
+        policy.update_workers(&first);
+        policy
+            .workers
+            .get_mut(&worker_rank)
+            .unwrap()
+            .capacity_tokens = Some(777);
+        policy.update_workers(&first);
+        assert_eq!(policy.workers[&worker_rank].capacity_tokens, Some(777));
+
+        policy.update_workers(&second);
+        assert_eq!(policy.workers[&worker_rank].capacity_tokens, Some(2_000));
+    }
+
+    #[test]
     fn aborted_request_rolls_back_new_program() {
-        let workers = [worker(1, 1_000)];
+        let workers = snapshot(1, vec![worker(1, 1_000)]);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -872,7 +913,7 @@ mod tests {
 
     #[test]
     fn sessionless_request_bypasses_without_state() {
-        let workers = [worker(1, 1_000)];
+        let workers = snapshot(1, vec![worker(1, 1_000)]);
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", None, &workers, 100)),
@@ -884,8 +925,8 @@ mod tests {
 
     #[test]
     fn reconcile_wakes_program_after_capacity_grows() {
-        let small = [worker(1, 250)];
-        let large = [worker(1, 500)];
+        let small = snapshot(1, vec![worker(1, 250)]);
+        let large = snapshot(2, vec![worker(1, 500)]);
         let first = context("session-a");
         let second = context("session-b");
         let mut policy = policy(ThunderAgentConfig {
@@ -904,7 +945,7 @@ mod tests {
         policy.next_tick = Instant::now();
         let mut ready = Vec::new();
         policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &large },
+            QueueAdmissionEvent::Reconcile { snapshot: &large },
             &mut ready,
         );
         assert_eq!(ready, [QueueAdmissionId::new(2)]);
@@ -916,7 +957,7 @@ mod tests {
 
     #[test]
     fn dispatch_records_actual_worker_for_next_turn() {
-        let workers = [worker(1, 1_000), worker(2, 1_000)];
+        let workers = snapshot(1, vec![worker(1, 1_000), worker(2, 1_000)]);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -950,8 +991,8 @@ mod tests {
 
     #[test]
     fn pressure_pauses_acting_program_and_capacity_resumes_it() {
-        let constrained = [worker(1, 500)];
-        let expanded = [worker(1, 1_000)];
+        let constrained = snapshot(1, vec![worker(1, 500)]);
+        let expanded = snapshot(2, vec![worker(1, 1_000)]);
         let session = context("session-a");
         let mut policy = policy(ThunderAgentConfig {
             buffer_per_program: 100,
@@ -979,7 +1020,7 @@ mod tests {
         policy.next_tick = Instant::now();
         policy.on_event(
             QueueAdmissionEvent::Reconcile {
-                workers: &constrained,
+                snapshot: &constrained,
             },
             &mut Vec::new(),
         );
@@ -990,7 +1031,9 @@ mod tests {
 
         policy.next_tick = Instant::now();
         policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &expanded },
+            QueueAdmissionEvent::Reconcile {
+                snapshot: &expanded,
+            },
             &mut Vec::new(),
         );
         assert_eq!(
