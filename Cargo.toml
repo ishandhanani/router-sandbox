@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/thunderagent"]
+members = ["crates/thunderagent", "crates/sticky-until-saturated"]
 resolver = "3"
 
 [workspace.package]
