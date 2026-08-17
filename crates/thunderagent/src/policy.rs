@@ -11,7 +11,7 @@ use crate::selection::SessionAssignments;
 use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::{
     QueueAdmissionDecision, QueueAdmissionEvent, QueueAdmissionId, QueueAdmissionPolicy,
-    QueueAdmissionRequest, QueueAdmissionWorker,
+    QueueAdmissionRequest, QueueAdmissionWorker, RequestProgress,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,7 @@ struct Program {
     lifecycle: ProgramLifecycle,
     assigned_worker: Option<WorkerWithDpRank>,
     token_total: usize,
+    request_progress: Option<RequestProgress>,
     step_count: usize,
     marked_for_pause: bool,
     acting_since: Option<Instant>,
@@ -45,6 +46,7 @@ impl Default for Program {
             lifecycle: ProgramLifecycle::Active,
             assigned_worker: None,
             token_total: 0,
+            request_progress: None,
             step_count: 0,
             marked_for_pause: false,
             acting_since: None,
@@ -57,6 +59,7 @@ struct RequestState {
     request_id: String,
     session_id: String,
     context_tokens: usize,
+    progress: RequestProgress,
     eligible_workers: HashSet<WorkerWithDpRank>,
     dispatched: bool,
     prior: Option<Program>,
@@ -148,12 +151,14 @@ impl ThunderAgentPolicy {
                 request_id: request.request_id().to_owned(),
                 session_id: session_id.to_owned(),
                 context_tokens: request.context_tokens(),
-                eligible_workers: request
-                    .workers()
-                    .iter()
-                    .filter(|worker| worker.is_eligible())
-                    .map(QueueAdmissionWorker::worker)
-                    .collect(),
+                progress: request.progress().clone(),
+                eligible_workers: {
+                    let mut eligible_workers = HashSet::new();
+                    request.for_each_eligible_worker(|worker| {
+                        eligible_workers.insert(worker.worker());
+                    });
+                    eligible_workers
+                },
                 dispatched: false,
                 prior: None,
             },
@@ -177,6 +182,7 @@ impl ThunderAgentPolicy {
         };
         let session_id = request.session_id.clone();
         let context_tokens = request.context_tokens;
+        let request_progress = request.progress.clone();
         let eligible_workers = request.eligible_workers.clone();
         let prior = self.programs.get(&session_id).cloned();
         let was_new = prior.is_none();
@@ -188,6 +194,7 @@ impl ThunderAgentPolicy {
             if context_tokens > 0 {
                 program.token_total = context_tokens;
             }
+            program.request_progress = Some(request_progress);
             program.status = ProgramStatus::Reasoning;
             program.acting_since = None;
         } else {
@@ -196,6 +203,7 @@ impl ThunderAgentPolicy {
                 Program {
                     step_count: 1,
                     token_total: context_tokens,
+                    request_progress: Some(request_progress),
                     ..Default::default()
                 },
             );
@@ -352,7 +360,9 @@ impl ThunderAgentPolicy {
                 }
             }
         } else if let Some(program) = self.programs.get_mut(&request.session_id) {
-            program.token_total = context_tokens.unwrap_or(request.context_tokens);
+            program.token_total =
+                context_tokens.unwrap_or_else(|| request.progress.context_tokens());
+            program.request_progress = None;
             program.status = ProgramStatus::Acting;
             program.acting_since = Some(Instant::now());
             if std::mem::take(&mut program.marked_for_pause) {
@@ -460,8 +470,9 @@ impl ThunderAgentPolicy {
     }
 
     fn program_tokens(&self, program: &Program, decayed: bool, now: Instant) -> usize {
+        let token_total = current_token_total(program);
         if program.status != ProgramStatus::Acting {
-            return program.token_total;
+            return token_total;
         }
         let weight = if decayed {
             let idle = program
@@ -471,7 +482,7 @@ impl ThunderAgentPolicy {
         } else {
             self.config.acting_token_weight
         };
-        scale_tokens(program.token_total, weight)
+        scale_tokens(token_total, weight)
     }
 
     fn worker_usage(&self, now: Instant) -> HashMap<WorkerWithDpRank, WorkerUsage> {
@@ -517,13 +528,12 @@ impl ThunderAgentPolicy {
             } else {
                 2
             };
-            (group, program.token_total)
+            (group, current_token_total(program))
         });
 
         let mut ready = Vec::new();
         for session_id in paused {
-            let required = self.programs[&session_id]
-                .token_total
+            let required = current_token_total(&self.programs[&session_id])
                 .saturating_add(self.config.buffer_per_program);
             let assigned = self.programs[&session_id].assigned_worker;
             let eligible = self
@@ -633,7 +643,7 @@ impl ThunderAgentPolicy {
             }
             .entry(worker)
             .or_default()
-            .push((program.token_total, session_id.clone()));
+            .push((current_token_total(program), session_id.clone()));
         }
         for programs in acting.values_mut().chain(reasoning.values_mut()) {
             programs.sort_by_key(|(tokens, _)| *tokens);
@@ -729,7 +739,9 @@ impl QueueAdmissionPolicy for ThunderAgentPolicy {
             QueueAdmissionEvent::Aborted { request_id } => {
                 ready.extend(self.finish_by_request_id(request_id, false, None));
             }
-            QueueAdmissionEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
+            QueueAdmissionEvent::Reconcile { snapshot } => {
+                ready.extend(self.reconcile(snapshot.workers()));
+            }
             _ => {}
         }
     }
@@ -745,18 +757,29 @@ fn scale_tokens(tokens: usize, factor: f64) -> usize {
     ((tokens as f64) * factor).clamp(0.0, usize::MAX as f64) as usize
 }
 
+fn current_token_total(program: &Program) -> usize {
+    program
+        .request_progress
+        .as_ref()
+        .map_or(program.token_total, RequestProgress::context_tokens)
+}
+
 fn sort_capacities(capacities: &mut [(WorkerWithDpRank, usize)]) {
     capacities.sort_unstable_by_key(|(worker, remaining)| (Reverse(*remaining), *worker));
 }
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::SessionContext;
+    use dynamo_kv_router::{QueueAdmissionWorkerSnapshot, SessionContext};
 
     use super::*;
 
     fn worker(id: u64, capacity: usize) -> QueueAdmissionWorker {
-        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
+        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true)
+    }
+
+    fn snapshot(workers: impl Into<Vec<QueueAdmissionWorker>>) -> QueueAdmissionWorkerSnapshot {
+        QueueAdmissionWorkerSnapshot::new(0, workers.into())
     }
 
     fn context(session_id: &str) -> SessionContext {
@@ -767,7 +790,7 @@ mod tests {
         id: u64,
         request_id: &'a str,
         session: Option<&'a SessionContext>,
-        workers: &'a [QueueAdmissionWorker],
+        workers: &'a QueueAdmissionWorkerSnapshot,
         tokens: usize,
     ) -> QueueAdmissionRequest<'a> {
         QueueAdmissionRequest::new(
@@ -786,6 +809,7 @@ mod tests {
     #[test]
     fn serializes_requests_for_one_session() {
         let workers = [worker(1, 1_000)];
+        let workers = snapshot(workers);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -817,6 +841,7 @@ mod tests {
     #[test]
     fn defers_when_program_capacity_is_exhausted() {
         let workers = [worker(1, 250)];
+        let workers = snapshot(workers);
         let first = context("session-a");
         let second = context("session-b");
         let mut policy = policy(ThunderAgentConfig {
@@ -835,15 +860,16 @@ mod tests {
 
     #[test]
     fn admission_ignores_request_ineligible_workers() {
-        let workers = [
-            QueueAdmissionWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
-            worker(2, 1_000),
-        ];
+        let workers = snapshot([worker(1, 1_000), worker(2, 1_000)]);
+        let eligible = HashSet::from([WorkerWithDpRank::new(2, 0)]);
         let session = context("session-a");
         let mut policy = policy(Default::default());
 
         assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
+            policy.admit(
+                request(1, "request-1", Some(&session), &workers, 100)
+                    .with_eligible_workers(&eligible)
+            ),
             QueueAdmissionDecision::Ready
         );
         assert_eq!(
@@ -855,6 +881,7 @@ mod tests {
     #[test]
     fn aborted_request_rolls_back_new_program() {
         let workers = [worker(1, 1_000)];
+        let workers = snapshot(workers);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -873,6 +900,7 @@ mod tests {
     #[test]
     fn sessionless_request_bypasses_without_state() {
         let workers = [worker(1, 1_000)];
+        let workers = snapshot(workers);
         let mut policy = policy(Default::default());
         assert_eq!(
             policy.admit(request(1, "request-1", None, &workers, 100)),
@@ -884,8 +912,8 @@ mod tests {
 
     #[test]
     fn reconcile_wakes_program_after_capacity_grows() {
-        let small = [worker(1, 250)];
-        let large = [worker(1, 500)];
+        let small = snapshot([worker(1, 250)]);
+        let large = snapshot([worker(1, 500)]);
         let first = context("session-a");
         let second = context("session-b");
         let mut policy = policy(ThunderAgentConfig {
@@ -904,7 +932,7 @@ mod tests {
         policy.next_tick = Instant::now();
         let mut ready = Vec::new();
         policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &large },
+            QueueAdmissionEvent::Reconcile { snapshot: &large },
             &mut ready,
         );
         assert_eq!(ready, [QueueAdmissionId::new(2)]);
@@ -917,6 +945,7 @@ mod tests {
     #[test]
     fn dispatch_records_actual_worker_for_next_turn() {
         let workers = [worker(1, 1_000), worker(2, 1_000)];
+        let workers = snapshot(workers);
         let session = context("session-a");
         let mut policy = policy(Default::default());
         assert_eq!(
@@ -949,9 +978,32 @@ mod tests {
     }
 
     #[test]
+    fn live_progress_updates_reasoning_worker_usage() {
+        let assigned = WorkerWithDpRank::new(1, 0);
+        let (progress, updater) = RequestProgress::new(100);
+        let mut policy = policy(ThunderAgentConfig {
+            buffer_per_program: 100,
+            ..Default::default()
+        });
+        policy.programs.insert(
+            "session-a".to_owned(),
+            Program {
+                assigned_worker: Some(assigned),
+                token_total: 100,
+                request_progress: Some(progress),
+                ..Default::default()
+            },
+        );
+
+        updater.update_context_tokens(400);
+
+        assert_eq!(policy.worker_usage(Instant::now())[&assigned].used, 500);
+    }
+
+    #[test]
     fn pressure_pauses_acting_program_and_capacity_resumes_it() {
-        let constrained = [worker(1, 500)];
-        let expanded = [worker(1, 1_000)];
+        let constrained = snapshot([worker(1, 500)]);
+        let expanded = snapshot([worker(1, 1_000)]);
         let session = context("session-a");
         let mut policy = policy(ThunderAgentConfig {
             buffer_per_program: 100,
@@ -979,7 +1031,7 @@ mod tests {
         policy.next_tick = Instant::now();
         policy.on_event(
             QueueAdmissionEvent::Reconcile {
-                workers: &constrained,
+                snapshot: &constrained,
             },
             &mut Vec::new(),
         );
@@ -990,7 +1042,9 @@ mod tests {
 
         policy.next_tick = Instant::now();
         policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &expanded },
+            QueueAdmissionEvent::Reconcile {
+                snapshot: &expanded,
+            },
             &mut Vec::new(),
         );
         assert_eq!(

@@ -57,7 +57,7 @@ fn provider(
         .validate()
         .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
     Ok(Arc::new(move |router, worker_type, _partition| {
-        validated_policy(router.clone(), worker_type, config.clone())
+        validated_policy(router.clone(), worker_type.as_str(), config.clone())
     }))
 }
 
