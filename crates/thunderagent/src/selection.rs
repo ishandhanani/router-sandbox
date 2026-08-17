@@ -59,20 +59,14 @@ impl WorkerScorer for ThunderAgentScorer {
 /// Preserves the admission policy's session assignment, then falls back to minimum score.
 pub(crate) struct ThunderAgentPicker {
     assignments: Arc<SessionAssignments>,
-    storage_handoff_experiment: bool,
-    emit_prefetch: bool,
+    emit_demote: bool,
 }
 
 impl ThunderAgentPicker {
-    pub(crate) fn new(
-        assignments: Arc<SessionAssignments>,
-        storage_handoff_experiment: bool,
-        emit_prefetch: bool,
-    ) -> Self {
+    pub(crate) fn new(assignments: Arc<SessionAssignments>, emit_demote: bool) -> Self {
         Self {
             assignments,
-            storage_handoff_experiment,
-            emit_prefetch,
+            emit_demote,
         }
     }
 }
@@ -87,13 +81,7 @@ impl WorkerPicker for ThunderAgentPicker {
         let assigned_worker = context
             .session_context()
             .and_then(|session| self.assignments.get(session.session_id()));
-        let storage_handoff = self.storage_handoff_experiment
-            && context
-                .session_context()
-                .and_then(|session| session.input_trigger())
-                == Some(WorkerSelectionInputTrigger::Other);
-        if !storage_handoff
-            && let Some(worker) = assigned_worker
+        if let Some(worker) = assigned_worker
             && let Some(row) = candidates
                 .iter()
                 .position(|candidate| candidate.worker() == worker)
@@ -101,13 +89,10 @@ impl WorkerPicker for ThunderAgentPicker {
             return Ok(row);
         }
 
-        let lowest_cost = |exclude_assigned: bool| {
+        let lowest_cost = || {
             candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, candidate)| {
-                    !exclude_assigned || Some(candidate.worker()) != assigned_worker
-                })
                 .min_by(|(_, left), (_, right)| {
                     left.cost()
                         .total_cmp(&right.cost())
@@ -115,9 +100,7 @@ impl WorkerPicker for ThunderAgentPicker {
                 })
                 .map(|(row, _)| row)
         };
-        lowest_cost(storage_handoff)
-            .or_else(|| lowest_cost(false))
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+        lowest_cost().ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
 
     fn kv_hint_actions(
@@ -125,7 +108,7 @@ impl WorkerPicker for ThunderAgentPicker {
         context: &WorkerSelectionContext<'_>,
         selected_worker: WorkerWithDpRank,
     ) -> Result<Vec<KvHintAction>, WorkerSelectionPolicyError> {
-        if !self.storage_handoff_experiment {
+        if !self.emit_demote {
             return Ok(Vec::new());
         }
         let Some(session) = context.session_context() else {
@@ -143,16 +126,6 @@ impl WorkerPicker for ThunderAgentPicker {
                         session_generation: None,
                     },
                 )])
-            }
-            Some(WorkerSelectionInputTrigger::Other)
-                if self.emit_prefetch
-                    && assigned_worker.is_some_and(|worker| worker != selected_worker) =>
-            {
-                Ok(vec![KvHintAction::prefetch(format!(
-                    "thunderagent-prefetch-{}-{}",
-                    session.session_id(),
-                    selected_worker.worker_id,
-                ))])
             }
             _ => Ok(Vec::new()),
         }

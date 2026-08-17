@@ -29,7 +29,7 @@ Requests without Dynamo session context bypass ThunderAgent admission and still 
 
 The crate also exposes `register`, so it can be linked directly as Dynamo's `dynamo-worker-selection-policy-catalog` dependency. The registered policy type is `thunderagent`; its YAML parameters are the fields of `ThunderAgentConfig`.
 
-For isolated cache-storage validation, the catalog also exposes `thunderagent-storage-handoff-experiment`. It keeps ThunderAgent admission unchanged. A repeated user request with no generated output stays on the assigned worker and emits `kv.demote`; the request must preserve the existing prompt prefix so the asynchronous demotion can release the session KV. The next `Other` request moves to an eligible alternate worker and emits `kv.prefetch`. `thunderagent-storage-handoff-no-prefetch-experiment` takes the same cross-worker path without the prefetch action, for a matched engine-restore control. These policy types are for end-to-end storage-hint runs only.
+For isolated cache-storage validation, the catalog also exposes `thunderagent-storage-demote-experiment`. It keeps ThunderAgent admission and placement unchanged. A repeated user request with no generated output stays on the assigned worker and emits `kv.demote`; the request must preserve the existing prompt prefix so the asynchronous demotion can release the session KV. This policy type is for end-to-end storage-hint runs only.
 
 [`worker-selection.yaml`](crates/thunderagent/worker-selection.yaml) is a complete policy configuration using the default ThunderAgent values.
 

@@ -33,7 +33,6 @@ pub fn worker_selection_policy(
         worker_type,
         config,
         false,
-        false,
     ))
 }
 
@@ -41,13 +40,12 @@ fn validated_policy(
     kv_router_config: KvRouterConfig,
     worker_type: WorkerType,
     config: ThunderAgentConfig,
-    storage_handoff_experiment: bool,
-    emit_prefetch: bool,
+    emit_demote: bool,
 ) -> WorkerSelectionPolicy {
     let assignments = Arc::new(SessionAssignments::default());
     let admission = ThunderAgentPolicy::new(config, Arc::clone(&assignments));
     let scorer = ThunderAgentScorer;
-    let picker = ThunderAgentPicker::new(assignments, storage_handoff_experiment, emit_prefetch);
+    let picker = ThunderAgentPicker::new(assignments, emit_demote);
     WorkerSelectionPolicy::new(
         kv_router_config,
         worker_type.as_str(),
@@ -60,38 +58,25 @@ fn validated_policy(
 fn provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    provider_with_storage_handoff(parameters, false, false)
+    provider_with_storage_demote(parameters, false)
 }
 
-fn storage_handoff_provider(
+fn storage_demote_provider(
     parameters: &WorkerSelectionPolicyParameters,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    provider_with_storage_handoff(parameters, true, true)
+    provider_with_storage_demote(parameters, true)
 }
 
-fn storage_handoff_without_prefetch_provider(
+fn provider_with_storage_demote(
     parameters: &WorkerSelectionPolicyParameters,
-) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    provider_with_storage_handoff(parameters, true, false)
-}
-
-fn provider_with_storage_handoff(
-    parameters: &WorkerSelectionPolicyParameters,
-    storage_handoff_experiment: bool,
-    emit_prefetch: bool,
+    emit_demote: bool,
 ) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
     let config: ThunderAgentConfig = parameters.deserialize()?;
     config
         .validate()
         .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
     Ok(Arc::new(move |router, worker_type, _partition| {
-        validated_policy(
-            router.clone(),
-            worker_type,
-            config.clone(),
-            storage_handoff_experiment,
-            emit_prefetch,
-        )
+        validated_policy(router.clone(), worker_type, config.clone(), emit_demote)
     }))
 }
 
@@ -101,12 +86,8 @@ pub fn register(
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
     registry.register("thunderagent", Arc::new(provider))?;
     registry.register(
-        "thunderagent-storage-handoff-experiment",
-        Arc::new(storage_handoff_provider),
-    )?;
-    registry.register(
-        "thunderagent-storage-handoff-no-prefetch-experiment",
-        Arc::new(storage_handoff_without_prefetch_provider),
+        "thunderagent-storage-demote-experiment",
+        Arc::new(storage_demote_provider),
     )
 }
 
