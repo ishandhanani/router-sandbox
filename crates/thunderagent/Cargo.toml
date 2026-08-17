@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["standalone-selection"] }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-live-progress", features = ["standalone-selection"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
