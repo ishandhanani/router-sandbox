@@ -9,7 +9,18 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+bench = []
+
 [dependencies]
 dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "main", features = ["standalone-selection"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sticky_until_saturated"
+harness = false
+required-features = ["bench"]

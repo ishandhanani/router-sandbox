@@ -217,6 +217,59 @@ fn primary_cost(
     }
 }
 
+/// Input row for the policy-only Criterion benchmark.
+///
+/// This is intentionally separate from Dynamo's host-owned candidate table. It exercises the
+/// picker's two scans and arithmetic without benchmarking discovery, eligibility, or transport.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct BenchmarkCandidate {
+    pub worker_key: u64,
+    pub device_overlap_blocks: f64,
+    pub active_prefill_tokens: usize,
+}
+
+/// Run the prefill decision over synthetic, already host-eligible candidate rows.
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub fn benchmark_prefill_pick_index(
+    config: &StickyUntilSaturatedConfig,
+    request_blocks: u64,
+    block_size: u32,
+    candidates: &[BenchmarkCandidate],
+) -> Option<usize> {
+    let is_warm = |candidate: &BenchmarkCandidate| {
+        request_blocks > 0
+            && candidate.device_overlap_blocks / request_blocks as f64 >= config.affinity_threshold
+    };
+    let projected_prefill = |candidate: &BenchmarkCandidate| {
+        candidate.active_prefill_tokens as f64
+            + (request_blocks as f64 - candidate.device_overlap_blocks).max(0.0) * block_size as f64
+    };
+    let best_warm_prefill = candidates
+        .iter()
+        .filter(|candidate| is_warm(candidate))
+        .map(projected_prefill)
+        .min_by(f64::total_cmp);
+
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            best_warm_prefill.is_none_or(|best_warm| {
+                is_warm(candidate)
+                    || projected_prefill(candidate) < best_warm - config.saturation_tokens()
+            })
+        })
+        .min_by(|(_, left), (_, right)| {
+            projected_prefill(left)
+                .total_cmp(&projected_prefill(right))
+                .then_with(|| left.worker_key.cmp(&right.worker_key))
+        })
+        .map(|(row, _)| row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

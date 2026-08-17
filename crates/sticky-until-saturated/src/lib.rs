@@ -8,6 +8,12 @@ mod selection;
 
 pub use config::{ConfigError, StickyUntilSaturatedConfig};
 
+#[cfg(feature = "bench")]
+#[doc(hidden)]
+pub mod benchmark {
+    pub use crate::selection::{BenchmarkCandidate, benchmark_prefill_pick_index};
+}
+
 use std::sync::Arc;
 
 use dynamo_kv_router::services::selection::{
