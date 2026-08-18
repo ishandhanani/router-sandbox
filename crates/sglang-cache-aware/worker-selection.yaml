@@ -1,0 +1,11 @@
+worker_selection:
+  aggregated: sglang-cache-aware
+  prefill: sglang-cache-aware
+  decode: sglang-cache-aware
+  instances:
+    - name: sglang-cache-aware
+      type: sglang-cache-aware
+      parameters:
+        cache_threshold: 0.3
+        balance_abs_threshold: 64
+        balance_rel_threshold: 1.5
