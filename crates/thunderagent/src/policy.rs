@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use dynamo_kv_router::scheduling::{
@@ -37,6 +38,7 @@ pub(crate) enum ThunderAgentError {
 struct Inner {
     state: Mutex<State>,
     capacity_provider: Arc<dyn WorkerCapacityProvider>,
+    scheduler_started: AtomicBool,
 }
 
 impl Inner {
@@ -56,6 +58,35 @@ impl Inner {
             &capacities,
             Instant::now(),
         )
+    }
+
+    fn start_scheduler(self: &Arc<Self>) {
+        if self
+            .scheduler_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let interval = self.state.lock().scheduler_interval();
+        let inner = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(inner) = inner.upgrade() else {
+                    break;
+                };
+                inner.reconcile();
+            }
+        });
+    }
+
+    fn reconcile(&self) {
+        if !self.state.lock().needs_reconcile() {
+            return;
+        }
+        let capacities = self.capacity_provider.snapshot();
+        self.state.lock().reconcile(&capacities, Instant::now());
     }
 
     fn on_event(&self, event: ClassifyEvent<'_>) {
@@ -107,19 +138,13 @@ async fn await_release<T>(
     mut pending: PendingClassification,
     value: T,
 ) -> Result<T, ThunderAgentError> {
+    pending.inner.start_scheduler();
     let inner = Arc::clone(&pending.inner);
     let request_id = pending.request_id.clone();
     loop {
         let notify = Arc::clone(&pending.notify);
         let notified = notify.notified();
-        let (status, interval) = {
-            let state = inner.state.lock();
-            let now = Instant::now();
-            (
-                state.wait_status(&request_id),
-                state.reconcile_delay(&request_id, now),
-            )
-        };
+        let status = inner.state.lock().wait_status(&request_id);
         match status {
             WaitStatus::Released => {
                 pending.disarm();
@@ -131,24 +156,7 @@ async fn await_release<T>(
             }
             WaitStatus::Waiting => {}
         }
-
-        if interval.is_some_and(|delay| delay.is_zero()) {
-            let capacities = inner.capacity_provider.snapshot();
-            inner
-                .state
-                .lock()
-                .reconcile_if_due(&request_id, &capacities, Instant::now());
-            continue;
-        }
-
-        if let Some(interval) = interval {
-            tokio::select! {
-                _ = notified => {}
-                _ = tokio::time::sleep(interval) => {}
-            }
-        } else {
-            notified.await;
-        }
+        notified.await;
     }
 }
 
@@ -168,6 +176,7 @@ impl ThunderAgentClassifier {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::new(config, assignments)),
                 capacity_provider,
+                scheduler_started: AtomicBool::new(false),
             }),
         })
     }
@@ -340,19 +349,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_session_frees_capacity_for_a_paused_program() {
-        let mut classifier = classifier(&[(1, 250)]);
-        register(&classifier, "request-1", "session-a", 200, true);
+    async fn final_session_frees_capacity_at_admission_without_restoring_on_abort() {
+        let snapshot = capacities(&[(1, 250)]);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                scheduler_interval_seconds: 1.0,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 200, false);
         release(&classifier, "request-1").await;
-        register(&classifier, "request-2", "session-b", 100, false);
+        completed(&mut classifier, "request-1", 200);
 
+        register(&classifier, "request-2", "session-b", 100, false);
         assert_eq!(
             classifier.inner.state.lock().wait_status("request-2"),
             WaitStatus::Waiting
         );
 
-        completed(&mut classifier, "request-1", 200);
+        register(&classifier, "request-3", "session-a", 1, true);
+        release(&classifier, "request-3").await;
+        assert!(
+            !classifier
+                .inner
+                .state
+                .lock()
+                .programs
+                .contains_key("session-a")
+        );
+        assert_eq!(
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
+        );
+
+        let capacity = capacities(&[(1, 250)]);
+        classifier
+            .inner
+            .state
+            .lock()
+            .reconcile(&capacity, Instant::now());
         release(&classifier, "request-2").await;
+
+        classifier.on_event(ClassifyEvent::Aborted {
+            request_id: "request-3",
+            worker: Some(WorkerWithDpRank::new(1, 0)),
+            error: None,
+        });
+        assert!(
+            !classifier
+                .inner
+                .state
+                .lock()
+                .programs
+                .contains_key("session-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn final_session_waits_for_inflight_turn_then_removes_program() {
+        let mut classifier = classifier(&[(1, 1_000)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-a", 1, true);
+
+        assert_eq!(
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
+        );
+        assert!(
+            classifier
+                .inner
+                .state
+                .lock()
+                .programs
+                .contains_key("session-a")
+        );
+
+        completed(&mut classifier, "request-1", 150);
+        release(&classifier, "request-2").await;
+        assert!(
+            !classifier
+                .inner
+                .state
+                .lock()
+                .programs
+                .contains_key("session-a")
+        );
     }
 
     #[tokio::test]
@@ -394,6 +480,7 @@ mod tests {
         let mut classifier = ThunderAgentClassifier::with_assignments(
             ThunderAgentConfig {
                 buffer_per_program: 100,
+                scheduler_interval_seconds: 0.05,
                 ..config()
             },
             provider,
@@ -406,12 +493,29 @@ mod tests {
         completed(&mut classifier, "request-1", 400);
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].lifecycle,
-            ProgramLifecycle::Paused
+            ProgramLifecycle::Active
         );
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if classifier.inner.state.lock().programs["session-a"].lifecycle
+                    == ProgramLifecycle::Paused
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
 
         *current.lock() = capacities(&[(1, 1_000)]);
         register(&classifier, "request-2", "session-a", 400, false);
-        release(&classifier, "request-2").await;
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            release(&classifier, "request-2"),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].lifecycle,
             ProgramLifecycle::Active
@@ -630,24 +734,6 @@ mod tests {
         assert_eq!(classifier.inner.state.lock().requests.len(), 1);
     }
 
-    #[test]
-    fn only_one_pending_request_drives_periodic_reconciliation() {
-        let classifier = classifier(&[(1, 1)]);
-        register(&classifier, "request-1", "session-a", 100, false);
-        register(&classifier, "request-2", "session-b", 100, false);
-        register(&classifier, "request-3", "session-c", 100, false);
-        assert_eq!(
-            classifier.inner.state.lock().timer_owner.as_deref(),
-            Some("request-1")
-        );
-
-        drop(pending(&classifier, "request-1"));
-        assert_eq!(
-            classifier.inner.state.lock().timer_owner.as_deref(),
-            Some("request-2")
-        );
-    }
-
     #[tokio::test]
     async fn retained_programs_are_bounded_by_the_tracking_limit() {
         let snapshot = capacities(&[(1, 1_000)]);
@@ -728,7 +814,6 @@ mod tests {
             REQUESTS
         );
         assert!(state.arrival_order.len() <= 256);
-        assert!(state.timer_owner.is_none());
     }
 
     #[tokio::test]

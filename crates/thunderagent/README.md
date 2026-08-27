@@ -44,7 +44,7 @@ ThunderAgent computes live used capacity from its own program table. This crate 
 
 On each reconciliation, the classifier accounts for active program tokens plus `buffer_per_program`. Acting programs use a configurable token weight and a decayed estimate for forced timeout resumption. When a worker exceeds `pause_threshold`, the classifier pauses smaller acting programs first until usage reaches `pause_target`; in-flight reasoning programs are marked to pause after completion. Paused programs resume greedily below `pause_threshold - resume_hysteresis`. A pending request is force-released after `resume_timeout_seconds` to avoid permanent starvation.
 
-Completion records Dynamo's terminal input-plus-output context size. This implementation deliberately matches the original Rust ThunderAgent baseline and does not consume per-token streaming progress. A final session removes its program immediately; a continuing idle program retains its assignment for `session_retention_seconds`. Idle retention is pruned lazily on the next classification or lifecycle-driven reconciliation. The tracking limit also bounds retained programs; at the limit, the oldest idle retained program is evicted before admitting a new session.
+Completion records Dynamo's terminal input-plus-output context size. The current classifier lifecycle does not expose the cumulative streaming context progress used by the final July ThunderAgent implementation, so this crate updates program size only at completion. A final session removes its program when the final request is admitted; completion or abort cannot restore it. A continuing idle program retains its assignment for `session_retention_seconds`. Idle retention is pruned lazily on the next classification or periodic reconciliation. The tracking limit also bounds retained programs; at the limit, the oldest idle retained program is evicted before admitting a new session.
 
 ## Construct the components
 
@@ -89,7 +89,7 @@ Install `classifier` through Dynamo's `KvRouter::with_request_classifier` seam a
 | `resume_hysteresis` | `0.10` | Headroom below the pause threshold required for normal resume |
 | `resume_timeout_seconds` | `1800` | Maximum classifier deferral before forced release |
 | `session_retention_seconds` | `1800` | Idle continuing-program retention period |
-| `scheduler_interval_seconds` | `5` | Maximum pending-future reevaluation interval |
+| `scheduler_interval_seconds` | `5` | Fixed cadence for pressure and resume decisions while programs are tracked |
 | `acting_token_weight` | `1` | Capacity weight for a program during tool work |
 | `acting_decay_tau_seconds` | `1` | Half-life control for forced-resume placement |
 | `buffer_per_program` | `100` | Fixed token headroom per active program |
