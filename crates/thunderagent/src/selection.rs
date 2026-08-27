@@ -34,7 +34,6 @@ impl SessionAssignments {
     }
 }
 
-/// Low-cost fallback for requests that do not yet have a session assignment.
 pub(crate) struct ThunderAgentScorer;
 
 impl WorkerScorer for ThunderAgentScorer {
@@ -55,7 +54,6 @@ impl WorkerScorer for ThunderAgentScorer {
     }
 }
 
-/// Preserves the admission policy's session assignment, then falls back to minimum score.
 pub(crate) struct ThunderAgentPicker {
     assignments: Arc<SessionAssignments>,
 }
@@ -93,5 +91,108 @@ impl WorkerPicker for ThunderAgentPicker {
             })
             .map(|(row, _)| row)
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use dynamo_kv_router::protocols::{RoutingConstraints, WorkerConfigLike, WorkerWithDpRank};
+    use dynamo_kv_router::scheduling::{OverlapSignals, ScheduleMode, SchedulingRequest};
+    use dynamo_kv_router::{
+        KvRouterConfig, SessionContext, WorkerSelectionInput, WorkerSelectionPolicy, WorkerSelector,
+    };
+
+    use super::*;
+
+    struct TestWorker;
+
+    impl WorkerConfigLike for TestWorker {
+        fn data_parallel_start_rank(&self) -> u32 {
+            0
+        }
+
+        fn data_parallel_size(&self) -> u32 {
+            1
+        }
+
+        fn max_num_batched_tokens(&self) -> Option<u64> {
+            None
+        }
+
+        fn total_kv_blocks(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    fn request(session_id: &str) -> SchedulingRequest {
+        SchedulingRequest {
+            mode: ScheduleMode::QueryOnly {
+                request_id: Some("request".into()),
+            },
+            token_seq: None,
+            isl_tokens: 16,
+            lora_name: None,
+            expected_output_tokens: None,
+            pinned_worker: None,
+            allowed_worker_ids: None,
+            routing_constraints: RoutingConstraints::default(),
+            router_config_override: None,
+            track_prefill_tokens: true,
+            priority_jump: 0.0,
+            strict_priority: 0,
+            policy_class: None,
+            session_context: Some(SessionContext::new(
+                session_id.into(),
+                None,
+                Some(false),
+                None,
+                None,
+            )),
+            overlap: OverlapSignals::default(),
+            router_hint_candidates: None,
+            retain_router_hint_chain: false,
+            shared_cache_hits: None,
+            worker_loads: Default::default(),
+            resp_tx: None,
+        }
+    }
+
+    #[test]
+    fn picker_honors_the_classifier_assignment_when_eligible() {
+        let worker_1 = WorkerWithDpRank::new(1, 0);
+        let worker_2 = WorkerWithDpRank::new(2, 0);
+        let workers = HashMap::from([(1, TestWorker), (2, TestWorker)]);
+        let assignments = Arc::new(SessionAssignments::default());
+        assignments.set("session-a", Some(worker_2));
+        let policy = WorkerSelectionPolicy::new(
+            KvRouterConfig::default(),
+            "test",
+            vec![Box::new(ThunderAgentScorer)],
+            Box::new(ThunderAgentPicker::new(assignments)),
+        );
+        let mut request = request("session-a");
+
+        let selected = policy
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        assert_eq!(selected.worker, worker_2);
+
+        request.pinned_worker = Some(worker_1);
+        let selected = policy
+            .select_worker(WorkerSelectionInput::configured(
+                &workers,
+                &request,
+                request.eligibility(),
+                16,
+            ))
+            .unwrap();
+        assert_eq!(selected.worker, worker_1);
     }
 }

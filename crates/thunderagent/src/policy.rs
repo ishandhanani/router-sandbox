@@ -1,1001 +1,816 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use crate::ThunderAgentConfig;
-use crate::selection::SessionAssignments;
-use dynamo_kv_router::protocols::WorkerWithDpRank;
-use dynamo_kv_router::{
-    QueueAdmissionDecision, QueueAdmissionEvent, QueueAdmissionId, QueueAdmissionPolicy,
-    QueueAdmissionRequest, QueueAdmissionWorker,
+use dynamo_kv_router::scheduling::{
+    ClassifyError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
 };
+use parking_lot::Mutex;
+use thiserror::Error;
+use tokio::sync::Notify;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgramStatus {
-    Reasoning,
-    Acting,
+use crate::capacity::WorkerCapacityProvider;
+use crate::scheduler::{State, WaitStatus};
+use crate::selection::SessionAssignments;
+use crate::{ConfigError, ThunderAgentConfig};
+
+#[derive(Debug, Error)]
+pub(crate) enum ThunderAgentError {
+    #[error("session-aware classification requires a request ID")]
+    MissingRequestId,
+
+    #[error("request {0:?} is already active in the ThunderAgent classifier")]
+    DuplicateRequestId(String),
+
+    #[error("request {0:?} ended while classification was pending")]
+    RequestEnded(String),
+
+    #[error("ThunderAgent is already tracking its configured limit of {limit} requests")]
+    RequestLimitExceeded { limit: usize },
+
+    #[error("ThunderAgent is already tracking its configured limit of {limit} programs")]
+    ProgramLimitExceeded { limit: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgramLifecycle {
-    Active,
-    Paused,
+struct Inner {
+    state: Mutex<State>,
+    capacity_provider: Arc<dyn WorkerCapacityProvider>,
 }
 
-#[derive(Clone)]
-struct Program {
-    status: ProgramStatus,
-    lifecycle: ProgramLifecycle,
-    assigned_worker: Option<WorkerWithDpRank>,
-    token_total: usize,
-    step_count: usize,
-    marked_for_pause: bool,
-    acting_since: Option<Instant>,
-    deferred_since: Option<Instant>,
-}
+impl Inner {
+    fn register(
+        &self,
+        request_id: String,
+        session_id: String,
+        input_tokens: usize,
+        session_final: bool,
+    ) -> Result<Arc<Notify>, ThunderAgentError> {
+        let capacities = self.capacity_provider.snapshot();
+        self.state.lock().register(
+            request_id,
+            session_id,
+            input_tokens,
+            session_final,
+            &capacities,
+            Instant::now(),
+        )
+    }
 
-impl Default for Program {
-    fn default() -> Self {
-        Self {
-            status: ProgramStatus::Reasoning,
-            lifecycle: ProgramLifecycle::Active,
-            assigned_worker: None,
-            token_total: 0,
-            step_count: 0,
-            marked_for_pause: false,
-            acting_since: None,
-            deferred_since: None,
-        }
+    fn on_event(&self, event: ClassifyEvent<'_>) {
+        let capacities = self.capacity_provider.snapshot();
+        self.state
+            .lock()
+            .on_event(event, &capacities, Instant::now());
+    }
+
+    fn cancel_request(&self, request_id: &str) {
+        let capacities = self.capacity_provider.snapshot();
+        self.state
+            .lock()
+            .cancel_request(request_id, &capacities, Instant::now());
     }
 }
 
-struct RequestState {
+struct PendingClassification {
+    inner: Arc<Inner>,
     request_id: String,
-    session_id: String,
-    context_tokens: usize,
-    eligible_workers: HashSet<WorkerWithDpRank>,
-    dispatched: bool,
-    prior: Option<Program>,
+    notify: Arc<Notify>,
+    armed: bool,
 }
 
-#[derive(Default)]
-struct SessionRequests {
-    current: Option<QueueAdmissionId>,
-    waiting: VecDeque<QueueAdmissionId>,
-}
-
-#[derive(Clone, Copy)]
-struct WorkerState {
-    capacity_tokens: Option<usize>,
-    available: bool,
-}
-
-#[derive(Default, Clone, Copy)]
-struct WorkerUsage {
-    used: usize,
-    decayed: usize,
-}
-
-impl WorkerUsage {
-    fn add_program(&mut self, normal: usize, decayed: usize, buffer: usize) {
-        self.used = self.used.saturating_add(normal).saturating_add(buffer);
-        self.decayed = self.decayed.saturating_add(decayed).saturating_add(buffer);
-    }
-
-    fn remove_program(&mut self, normal: usize, decayed: usize, buffer: usize) {
-        self.used = self.used.saturating_sub(normal).saturating_sub(buffer);
-        self.decayed = self.decayed.saturating_sub(decayed).saturating_sub(buffer);
-    }
-}
-
-/// Session-aware admission state owned by one Dynamo policy queue.
-pub(crate) struct ThunderAgentPolicy {
-    config: ThunderAgentConfig,
-    programs: HashMap<String, Program>,
-    paused: HashSet<String>,
-    requests: HashMap<QueueAdmissionId, RequestState>,
-    request_ids: HashMap<String, QueueAdmissionId>,
-    sessions: HashMap<String, SessionRequests>,
-    workers: HashMap<WorkerWithDpRank, WorkerState>,
-    assignments: Arc<SessionAssignments>,
-    next_tick: Instant,
-}
-
-impl ThunderAgentPolicy {
-    pub(crate) fn new(config: ThunderAgentConfig, assignments: Arc<SessionAssignments>) -> Self {
-        let next_tick = Instant::now() + Duration::from_secs_f64(config.scheduler_interval_seconds);
+impl PendingClassification {
+    fn new(inner: Arc<Inner>, request_id: String, notify: Arc<Notify>) -> Self {
         Self {
-            config,
-            programs: HashMap::new(),
-            paused: HashSet::new(),
-            requests: HashMap::new(),
-            request_ids: HashMap::new(),
-            sessions: HashMap::new(),
-            workers: HashMap::new(),
-            assignments,
-            next_tick,
+            inner,
+            request_id,
+            notify,
+            armed: true,
         }
     }
 
-    fn admit_request(&mut self, request: QueueAdmissionRequest<'_>) -> QueueAdmissionDecision {
-        let Some(session_id) = request
-            .session_context()
-            .map(|context| context.session_id())
-        else {
-            return QueueAdmissionDecision::Bypass;
-        };
-        if self.request_ids.contains_key(request.request_id()) {
-            tracing::warn!(
-                request_id = request.request_id(),
-                "Duplicate active request ID"
-            );
-            return QueueAdmissionDecision::Bypass;
-        }
-
-        self.update_workers(request.workers());
-        let id = request.id();
-        let session_is_busy = self
-            .sessions
-            .get(session_id)
-            .is_some_and(|requests| requests.current.is_some());
-        self.requests.insert(
-            id,
-            RequestState {
-                request_id: request.request_id().to_owned(),
-                session_id: session_id.to_owned(),
-                context_tokens: request.context_tokens(),
-                eligible_workers: request
-                    .workers()
-                    .iter()
-                    .filter(|worker| worker.is_eligible())
-                    .map(QueueAdmissionWorker::worker)
-                    .collect(),
-                dispatched: false,
-                prior: None,
-            },
-        );
-        self.request_ids.insert(request.request_id().to_owned(), id);
-        if session_is_busy {
-            self.sessions
-                .get_mut(session_id)
-                .expect("busy session exists")
-                .waiting
-                .push_back(id);
-            return QueueAdmissionDecision::Defer;
-        }
-
-        self.begin_request(id, Instant::now())
+    fn disarm(&mut self) {
+        self.armed = false;
     }
+}
 
-    fn begin_request(&mut self, id: QueueAdmissionId, now: Instant) -> QueueAdmissionDecision {
-        let Some(request) = self.requests.get(&id) else {
-            return QueueAdmissionDecision::Defer;
-        };
-        let session_id = request.session_id.clone();
-        let context_tokens = request.context_tokens;
-        let eligible_workers = request.eligible_workers.clone();
-        let prior = self.programs.get(&session_id).cloned();
-        let was_new = prior.is_none();
-        self.requests.get_mut(&id).expect("request exists").prior = prior;
-        self.sessions.entry(session_id.clone()).or_default().current = Some(id);
-
-        if let Some(program) = self.programs.get_mut(&session_id) {
-            program.step_count = program.step_count.saturating_add(1);
-            if context_tokens > 0 {
-                program.token_total = context_tokens;
-            }
-            program.status = ProgramStatus::Reasoning;
-            program.acting_since = None;
-        } else {
-            self.programs.insert(
-                session_id.clone(),
-                Program {
-                    step_count: 1,
-                    token_total: context_tokens,
-                    ..Default::default()
-                },
-            );
-        }
-
-        let program = &self.programs[&session_id];
-        if program.lifecycle == ProgramLifecycle::Paused {
-            self.defer_request(&session_id, now, false);
-            return QueueAdmissionDecision::Defer;
-        }
-        if let Some(worker) = program.assigned_worker
-            && eligible_workers.contains(&worker)
-        {
-            match self.workers.get(&worker) {
-                Some(worker_state) if worker_state.available => {
-                    return QueueAdmissionDecision::Ready;
-                }
-                Some(_) => {
-                    self.defer_request(&session_id, now, true);
-                    return QueueAdmissionDecision::Defer;
-                }
-                None => self.set_assignment(&session_id, None),
-            }
-        } else if program.assigned_worker.is_some() {
-            self.set_assignment(&session_id, None);
-        }
-
-        if was_new && !self.paused.is_empty() {
-            self.defer_request(&session_id, now, false);
-            return QueueAdmissionDecision::Defer;
-        }
-
-        let capacities: Vec<_> = self
-            .available_capacities()
-            .into_iter()
-            .filter(|(worker, _)| eligible_workers.contains(worker))
-            .collect();
-        if capacities.is_empty() {
-            return QueueAdmissionDecision::Ready;
-        }
-        let required = context_tokens.saturating_add(self.config.buffer_per_program);
-        let usage = self.worker_usage(now);
-        let selected = capacities
-            .into_iter()
-            .filter_map(|(worker, capacity)| {
-                let used = usage.get(&worker).map_or(0, |usage| usage.used);
-                capacity
-                    .checked_sub(used)
-                    .is_some_and(|remaining| remaining >= required)
-                    .then_some((worker, used))
-            })
-            .min_by_key(|(worker, used)| (*used, *worker))
-            .map(|(worker, _)| worker);
-        match selected {
-            Some(worker) => {
-                self.set_assignment(&session_id, Some(worker));
-                QueueAdmissionDecision::Ready
-            }
-            None => {
-                self.defer_request(&session_id, now, false);
-                QueueAdmissionDecision::Defer
-            }
+impl Drop for PendingClassification {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.cancel_request(&self.request_id);
         }
     }
+}
 
-    fn defer_request(&mut self, session_id: &str, now: Instant, preserve_assignment: bool) {
-        let Some(program) = self.programs.get_mut(session_id) else {
-            return;
-        };
-        program.lifecycle = ProgramLifecycle::Paused;
-        program.deferred_since = Some(now);
-        if !preserve_assignment {
-            self.set_assignment(session_id, None);
-        }
-        self.paused.insert(session_id.to_owned());
-    }
-
-    fn dispatched(&mut self, id: QueueAdmissionId, worker: WorkerWithDpRank) {
-        let Some(request) = self.requests.get_mut(&id) else {
-            return;
-        };
-        if self
-            .sessions
-            .get(&request.session_id)
-            .and_then(|requests| requests.current)
-            != Some(id)
-        {
-            return;
-        }
-        request.dispatched = true;
-        let session_id = request.session_id.clone();
-        self.set_assignment(&session_id, Some(worker));
-    }
-
-    fn finish_by_request_id(
-        &mut self,
-        request_id: &str,
-        completed: bool,
-        context_tokens: Option<usize>,
-    ) -> Vec<QueueAdmissionId> {
-        let Some(id) = self.request_ids.remove(request_id) else {
-            return Vec::new();
-        };
-        self.finish_request(id, completed, context_tokens)
-    }
-
-    fn finish_request(
-        &mut self,
-        id: QueueAdmissionId,
-        completed: bool,
-        context_tokens: Option<usize>,
-    ) -> Vec<QueueAdmissionId> {
-        let Some(request) = self.requests.remove(&id) else {
-            return Vec::new();
-        };
-        debug_assert_eq!(self.request_ids.remove(&request.request_id), None);
-        let is_current = self
-            .sessions
-            .get(&request.session_id)
-            .and_then(|requests| requests.current)
-            == Some(id);
-        if !is_current {
-            if let Some(requests) = self.sessions.get_mut(&request.session_id)
-                && let Some(index) = requests.waiting.iter().position(|waiting| *waiting == id)
-            {
-                requests.waiting.remove(index);
-            }
-            return Vec::new();
-        }
-
-        if let Some(requests) = self.sessions.get_mut(&request.session_id) {
-            requests.current = None;
-        }
-        if let Some(program) = self.programs.get_mut(&request.session_id) {
-            program.deferred_since = None;
-        }
-        if !request.dispatched || !completed {
-            match request.prior {
-                Some(prior) => {
-                    let paused = prior.lifecycle == ProgramLifecycle::Paused;
-                    let assignment = prior.assigned_worker;
-                    self.programs.insert(request.session_id.clone(), prior);
-                    self.assignments.set(&request.session_id, assignment);
-                    if paused {
-                        self.paused.insert(request.session_id.clone());
-                    } else {
-                        self.paused.remove(&request.session_id);
-                    }
-                }
-                None => {
-                    self.programs.remove(&request.session_id);
-                    self.paused.remove(&request.session_id);
-                    self.assignments.set(&request.session_id, None);
-                }
-            }
-        } else if let Some(program) = self.programs.get_mut(&request.session_id) {
-            program.token_total = context_tokens.unwrap_or(request.context_tokens);
-            program.status = ProgramStatus::Acting;
-            program.acting_since = Some(Instant::now());
-            if std::mem::take(&mut program.marked_for_pause) {
-                self.pause_acting(&request.session_id);
-            }
-        }
-
-        self.promote_next(&request.session_id)
-    }
-
-    fn promote_next(&mut self, session_id: &str) -> Vec<QueueAdmissionId> {
-        let next = self
-            .sessions
-            .get_mut(session_id)
-            .and_then(|requests| requests.waiting.pop_front());
-        let Some(id) = next else {
-            self.sessions.remove(session_id);
-            return Vec::new();
-        };
-        match self.begin_request(id, Instant::now()) {
-            QueueAdmissionDecision::Ready => vec![id],
-            _ => Vec::new(),
-        }
-    }
-
-    fn reconcile(&mut self, workers: &[QueueAdmissionWorker]) -> Vec<QueueAdmissionId> {
-        self.update_workers(workers);
-        let now = Instant::now();
-        if now < self.next_tick {
-            return Vec::new();
-        }
-        self.next_tick = now + Duration::from_secs_f64(self.config.scheduler_interval_seconds);
-        self.expire_retained_programs(now);
-        let mut usage = self.worker_usage(now);
-        let mut ready = self.greedy_resume(&mut usage, now);
-        ready.extend(self.force_timed_out(&mut usage, now));
-        self.pause_until_safe(&mut usage, now);
-        ready
-    }
-
-    fn update_workers(&mut self, workers: &[QueueAdmissionWorker]) {
-        self.workers.clear();
-        self.workers.extend(workers.iter().map(|worker| {
+async fn await_release<T>(
+    mut pending: PendingClassification,
+    value: T,
+) -> Result<T, ThunderAgentError> {
+    let inner = Arc::clone(&pending.inner);
+    let request_id = pending.request_id.clone();
+    loop {
+        let notify = Arc::clone(&pending.notify);
+        let notified = notify.notified();
+        let (status, interval) = {
+            let state = inner.state.lock();
+            let now = Instant::now();
             (
-                worker.worker(),
-                WorkerState {
-                    capacity_tokens: worker.capacity_tokens(),
-                    available: worker.is_available(),
-                },
+                state.wait_status(&request_id),
+                state.reconcile_delay(&request_id, now),
             )
-        }));
-        let removed: Vec<String> = self
-            .programs
-            .iter()
-            .filter(|(_, program)| {
-                program
-                    .assigned_worker
-                    .is_some_and(|worker| !self.workers.contains_key(&worker))
-            })
-            .map(|(session_id, _)| session_id.clone())
-            .collect();
-        for session_id in removed {
-            self.set_assignment(&session_id, None);
+        };
+        match status {
+            WaitStatus::Released => {
+                pending.disarm();
+                return Ok(value);
+            }
+            WaitStatus::Missing => {
+                pending.disarm();
+                return Err(ThunderAgentError::RequestEnded(request_id));
+            }
+            WaitStatus::Waiting => {}
         }
-    }
 
-    fn available_capacities(&self) -> Vec<(WorkerWithDpRank, usize)> {
-        self.workers
-            .iter()
-            .filter_map(|(&worker, state)| {
-                (state.available)
-                    .then_some(state.capacity_tokens)
-                    .flatten()
-                    .map(|capacity| (worker, capacity))
-            })
-            .collect()
-    }
-
-    fn set_assignment(&mut self, session_id: &str, worker: Option<WorkerWithDpRank>) {
-        if let Some(program) = self.programs.get_mut(session_id) {
-            program.assigned_worker = worker;
+        if interval.is_some_and(|delay| delay.is_zero()) {
+            let capacities = inner.capacity_provider.snapshot();
+            inner
+                .state
+                .lock()
+                .reconcile_if_due(&request_id, &capacities, Instant::now());
+            continue;
         }
-        self.assignments.set(session_id, worker);
-    }
 
-    fn expire_retained_programs(&mut self, now: Instant) {
-        let retention = Duration::from_secs_f64(self.config.session_retention_seconds);
-        let expired: Vec<String> = self
-            .programs
-            .iter()
-            .filter(|(session_id, program)| {
-                program.status == ProgramStatus::Acting
-                    && !self.sessions.contains_key(session_id.as_str())
-                    && program
-                        .acting_since
-                        .is_some_and(|since| now.saturating_duration_since(since) >= retention)
-            })
-            .map(|(session_id, _)| session_id.clone())
-            .collect();
-        for session_id in expired {
-            self.programs.remove(&session_id);
-            self.paused.remove(&session_id);
-            self.assignments.set(&session_id, None);
-        }
-    }
-
-    fn program_tokens(&self, program: &Program, decayed: bool, now: Instant) -> usize {
-        if program.status != ProgramStatus::Acting {
-            return program.token_total;
-        }
-        let weight = if decayed {
-            let idle = program
-                .acting_since
-                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-            2.0_f64.powf(-idle.as_secs_f64() / self.config.acting_decay_tau_seconds)
+        if let Some(interval) = interval {
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(interval) => {}
+            }
         } else {
-            self.config.acting_token_weight
+            notified.await;
+        }
+    }
+}
+
+/// Program-aware flow control implemented on Dynamo's request-classifier seam.
+pub struct ThunderAgentClassifier {
+    inner: Arc<Inner>,
+}
+
+impl ThunderAgentClassifier {
+    pub(crate) fn with_assignments(
+        config: ThunderAgentConfig,
+        capacity_provider: Arc<dyn WorkerCapacityProvider>,
+        assignments: Arc<SessionAssignments>,
+    ) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                state: Mutex::new(State::new(config, assignments)),
+                capacity_provider,
+            }),
+        })
+    }
+}
+
+impl RequestClassifier for ThunderAgentClassifier {
+    fn classify(&mut self, request: ClassifyRequest) -> ClassifyFuture {
+        let Some(session) = request.session_context() else {
+            return Box::pin(async move { Ok(request) });
         };
-        scale_tokens(program.token_total, weight)
-    }
-
-    fn worker_usage(&self, now: Instant) -> HashMap<WorkerWithDpRank, WorkerUsage> {
-        let mut usage = HashMap::<WorkerWithDpRank, WorkerUsage>::new();
-        for program in self.programs.values() {
-            if program.lifecycle == ProgramLifecycle::Active
-                && let Some(worker) = program.assigned_worker
-            {
-                usage.entry(worker).or_default().add_program(
-                    self.program_tokens(program, false, now),
-                    self.program_tokens(program, true, now),
-                    self.config.buffer_per_program,
-                );
-            }
-        }
-        usage
-    }
-
-    fn greedy_resume(
-        &mut self,
-        usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
-        now: Instant,
-    ) -> Vec<QueueAdmissionId> {
-        let ceiling = (self.config.pause_threshold - self.config.resume_hysteresis).max(0.0);
-        let mut capacities: Vec<(WorkerWithDpRank, usize)> = self
-            .available_capacities()
-            .into_iter()
-            .filter_map(|(worker, capacity)| {
-                let limit = scale_tokens(capacity, ceiling);
-                let remaining = limit.saturating_sub(usage.get(&worker).map_or(0, |u| u.used));
-                (remaining > self.config.buffer_per_program).then_some((worker, remaining))
-            })
-            .collect();
-        sort_capacities(&mut capacities);
-
-        let mut paused: Vec<String> = self.paused.iter().cloned().collect();
-        paused.sort_by_key(|session_id| {
-            let program = &self.programs[session_id];
-            let group = if program.step_count <= 1 {
-                1
-            } else if program.status == ProgramStatus::Reasoning {
-                0
-            } else {
-                2
-            };
-            (group, program.token_total)
-        });
-
-        let mut ready = Vec::new();
-        for session_id in paused {
-            let required = self.programs[&session_id]
-                .token_total
-                .saturating_add(self.config.buffer_per_program);
-            let assigned = self.programs[&session_id].assigned_worker;
-            let eligible = self
-                .sessions
-                .get(&session_id)
-                .and_then(|requests| requests.current)
-                .and_then(|id| self.requests.get(&id))
-                .map(|request| &request.eligible_workers);
-            let Some(position) = capacities.iter().position(|(worker, remaining)| {
-                eligible.is_none_or(|eligible| eligible.contains(worker))
-                    && assigned.is_none_or(|assigned| assigned == *worker)
-                    && required <= *remaining
-            }) else {
-                continue;
-            };
-            let (worker, remaining) = capacities[position];
-            ready.extend(self.resume_program(&session_id, Some(worker)));
-            let program = &self.programs[&session_id];
-            usage.entry(worker).or_default().add_program(
-                self.program_tokens(program, false, now),
-                self.program_tokens(program, true, now),
-                self.config.buffer_per_program,
-            );
-            capacities[position].1 = remaining - required;
-            sort_capacities(&mut capacities);
-        }
-        ready
-    }
-
-    fn force_timed_out(
-        &mut self,
-        usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
-        now: Instant,
-    ) -> Vec<QueueAdmissionId> {
-        let timeout = Duration::from_secs_f64(self.config.resume_timeout_seconds);
-        let timed_out: Vec<String> = self
-            .paused
-            .iter()
-            .filter(|session_id| {
-                self.programs
-                    .get(*session_id)
-                    .and_then(|program| program.deferred_since)
-                    .is_some_and(|since| now.saturating_duration_since(since) >= timeout)
-            })
-            .cloned()
-            .collect();
-        let capacities = self.available_capacities();
-        let mut ready = Vec::new();
-        for session_id in timed_out {
-            let assigned = self.programs[&session_id].assigned_worker;
-            let eligible = self
-                .sessions
-                .get(&session_id)
-                .and_then(|requests| requests.current)
-                .and_then(|id| self.requests.get(&id))
-                .map(|request| &request.eligible_workers);
-            let target = capacities
-                .iter()
-                .filter(|(worker, _)| {
-                    eligible.is_none_or(|eligible| eligible.contains(worker))
-                        && assigned.is_none_or(|assigned| assigned == *worker)
-                })
-                .max_by_key(|(worker, capacity)| {
-                    (
-                        *capacity as i128
-                            - usage.get(worker).map_or(0, |usage| usage.decayed) as i128,
-                        Reverse(*worker),
-                    )
-                })
-                .map(|(worker, _)| *worker);
-            let any_available = self.workers.iter().any(|(worker, state)| {
-                state.available && eligible.is_none_or(|eligible| eligible.contains(worker))
+        let Some(request_id) = request.request_id().map(str::to_owned) else {
+            return Box::pin(async move {
+                Err(Box::new(ThunderAgentError::MissingRequestId) as Box<ClassifyError>)
             });
-            if target.is_none() && !any_available {
-                continue;
-            }
-            ready.extend(self.resume_program(&session_id, target));
-            if let Some(worker) = target {
-                let program = &self.programs[&session_id];
-                usage.entry(worker).or_default().add_program(
-                    self.program_tokens(program, false, now),
-                    self.program_tokens(program, true, now),
-                    self.config.buffer_per_program,
-                );
-            }
-        }
-        ready
-    }
-
-    fn pause_until_safe(
-        &mut self,
-        usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
-        now: Instant,
-    ) {
-        let mut acting = HashMap::<WorkerWithDpRank, Vec<(usize, String)>>::new();
-        let mut reasoning = HashMap::<WorkerWithDpRank, Vec<(usize, String)>>::new();
-        for (session_id, program) in &self.programs {
-            if program.lifecycle != ProgramLifecycle::Active || program.marked_for_pause {
-                continue;
-            }
-            let Some(worker) = program.assigned_worker else {
-                continue;
-            };
-            match program.status {
-                ProgramStatus::Acting => &mut acting,
-                ProgramStatus::Reasoning => &mut reasoning,
-            }
-            .entry(worker)
-            .or_default()
-            .push((program.token_total, session_id.clone()));
-        }
-        for programs in acting.values_mut().chain(reasoning.values_mut()) {
-            programs.sort_by_key(|(tokens, _)| *tokens);
-        }
-
-        for (worker, capacity) in self.available_capacities() {
-            let threshold = scale_tokens(capacity, self.config.pause_threshold);
-            if usage.get(&worker).map_or(0, |usage| usage.used) <= threshold {
-                continue;
-            }
-            let target = scale_tokens(capacity, self.config.pause_target);
-            if let Some(programs) = acting.get(&worker) {
-                for (_, session_id) in programs {
-                    if usage.get(&worker).map_or(0, |usage| usage.used) <= target {
-                        break;
-                    }
-                    let program = &self.programs[session_id];
-                    let normal = self.program_tokens(program, false, now);
-                    let decayed = self.program_tokens(program, true, now);
-                    self.pause_acting(session_id);
-                    usage.entry(worker).or_default().remove_program(
-                        normal,
-                        decayed,
-                        self.config.buffer_per_program,
-                    );
-                }
-            }
-            if usage.get(&worker).map_or(0, |usage| usage.used) > target
-                && let Some(programs) = reasoning.get(&worker)
+        };
+        let session_id = session.session_id().to_owned();
+        let session_final = session.session_final() == Some(true);
+        let input_tokens = request.input_tokens();
+        let notify =
+            match self
+                .inner
+                .register(request_id.clone(), session_id, input_tokens, session_final)
             {
-                for (_, session_id) in programs {
-                    if let Some(program) = self.programs.get_mut(session_id) {
-                        program.marked_for_pause = true;
-                    }
+                Ok(notify) => notify,
+                Err(error) => {
+                    return Box::pin(async move { Err(Box::new(error) as Box<ClassifyError>) });
                 }
-            }
-        }
+            };
+
+        let inner = Arc::clone(&self.inner);
+        let pending = PendingClassification::new(inner, request_id, notify);
+        Box::pin(async move {
+            await_release(pending, request)
+                .await
+                .map_err(|error| Box::new(error) as Box<ClassifyError>)
+        })
     }
 
-    fn pause_acting(&mut self, session_id: &str) {
-        let Some(program) = self.programs.get_mut(session_id) else {
-            return;
-        };
-        if program.lifecycle != ProgramLifecycle::Active || program.status != ProgramStatus::Acting
-        {
-            return;
-        }
-        program.lifecycle = ProgramLifecycle::Paused;
-        self.set_assignment(session_id, None);
-        self.paused.insert(session_id.to_owned());
+    fn on_event(&mut self, event: ClassifyEvent<'_>) {
+        self.inner.on_event(event);
     }
-
-    fn resume_program(
-        &mut self,
-        session_id: &str,
-        worker: Option<WorkerWithDpRank>,
-    ) -> Vec<QueueAdmissionId> {
-        let deferred_id = self
-            .sessions
-            .get(session_id)
-            .and_then(|requests| requests.current);
-        let Some(program) = self.programs.get_mut(session_id) else {
-            return Vec::new();
-        };
-        if program.lifecycle != ProgramLifecycle::Paused {
-            return Vec::new();
-        }
-        program.lifecycle = ProgramLifecycle::Active;
-        let was_deferred = program.deferred_since.take().is_some();
-        self.set_assignment(session_id, worker);
-        self.paused.remove(session_id);
-        match (was_deferred, deferred_id) {
-            (true, Some(id)) => vec![id],
-            _ => Vec::new(),
-        }
-    }
-}
-
-impl QueueAdmissionPolicy for ThunderAgentPolicy {
-    fn admit(&mut self, request: QueueAdmissionRequest<'_>) -> QueueAdmissionDecision {
-        self.admit_request(request)
-    }
-
-    fn on_event(&mut self, event: QueueAdmissionEvent<'_>, ready: &mut Vec<QueueAdmissionId>) {
-        match event {
-            QueueAdmissionEvent::Dispatched { id, worker } => self.dispatched(id, worker),
-            QueueAdmissionEvent::Completed {
-                request_id,
-                context_tokens,
-            } => {
-                ready.extend(self.finish_by_request_id(request_id, true, context_tokens));
-            }
-            QueueAdmissionEvent::Aborted { request_id } => {
-                ready.extend(self.finish_by_request_id(request_id, false, None));
-            }
-            QueueAdmissionEvent::Reconcile { workers } => ready.extend(self.reconcile(workers)),
-            _ => {}
-        }
-    }
-
-    fn reconcile_interval(&self) -> Option<Duration> {
-        Some(Duration::from_secs_f64(
-            self.config.scheduler_interval_seconds,
-        ))
-    }
-}
-
-fn scale_tokens(tokens: usize, factor: f64) -> usize {
-    ((tokens as f64) * factor).clamp(0.0, usize::MAX as f64) as usize
-}
-
-fn sort_capacities(capacities: &mut [(WorkerWithDpRank, usize)]) {
-    capacities.sort_unstable_by_key(|(worker, remaining)| (Reverse(*remaining), *worker));
 }
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::SessionContext;
+    use std::time::Duration;
+
+    use dynamo_kv_router::protocols::WorkerWithDpRank;
 
     use super::*;
+    use crate::capacity::WorkerCapacitySnapshot;
+    use crate::scheduler::ProgramLifecycle;
 
-    fn worker(id: u64, capacity: usize) -> QueueAdmissionWorker {
-        QueueAdmissionWorker::new(WorkerWithDpRank::new(id, 0), Some(capacity), true, true)
+    fn config() -> ThunderAgentConfig {
+        ThunderAgentConfig {
+            scheduler_interval_seconds: 0.005,
+            resume_timeout_seconds: 1.0,
+            session_retention_seconds: 1.0,
+            buffer_per_program: 0,
+            ..Default::default()
+        }
     }
 
-    fn context(session_id: &str) -> SessionContext {
-        SessionContext::new(session_id.to_owned(), None, None, None, None)
+    fn capacities(values: &[(u64, usize)]) -> Arc<WorkerCapacitySnapshot> {
+        Arc::new(WorkerCapacitySnapshot::new(values.iter().map(
+            |&(worker, capacity)| (WorkerWithDpRank::new(worker, 0), capacity),
+        )))
     }
 
-    fn request<'a>(
-        id: u64,
-        request_id: &'a str,
-        session: Option<&'a SessionContext>,
-        workers: &'a [QueueAdmissionWorker],
-        tokens: usize,
-    ) -> QueueAdmissionRequest<'a> {
-        QueueAdmissionRequest::new(
-            QueueAdmissionId::new(id),
-            request_id,
-            tokens,
-            session,
-            workers,
+    fn classifier(values: &[(u64, usize)]) -> ThunderAgentClassifier {
+        let snapshot = capacities(values);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        ThunderAgentClassifier::with_assignments(
+            config(),
+            provider,
+            Arc::new(SessionAssignments::default()),
         )
+        .unwrap()
     }
 
-    fn policy(config: ThunderAgentConfig) -> ThunderAgentPolicy {
-        ThunderAgentPolicy::new(config, Arc::new(SessionAssignments::default()))
+    fn register(
+        classifier: &ThunderAgentClassifier,
+        request_id: &str,
+        session_id: &str,
+        tokens: usize,
+        session_final: bool,
+    ) {
+        classifier
+            .inner
+            .register(
+                request_id.to_owned(),
+                session_id.to_owned(),
+                tokens,
+                session_final,
+            )
+            .unwrap();
     }
 
-    #[test]
-    fn serializes_requests_for_one_session() {
-        let workers = [worker(1, 1_000)];
-        let session = context("session-a");
-        let mut policy = policy(Default::default());
-        assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        assert_eq!(
-            policy.admit(request(2, "request-2", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Defer
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Dispatched {
-                id: QueueAdmissionId::new(1),
-                worker: WorkerWithDpRank::new(1, 0),
-            },
-            &mut Vec::new(),
-        );
-        let mut ready = Vec::new();
-        policy.on_event(
-            QueueAdmissionEvent::Completed {
-                request_id: "request-1",
-                context_tokens: Some(150),
-            },
-            &mut ready,
-        );
-        assert_eq!(ready, [QueueAdmissionId::new(2)]);
+    async fn release(classifier: &ThunderAgentClassifier, request_id: &str) {
+        await_release(pending(classifier, request_id), ())
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn defers_when_program_capacity_is_exhausted() {
-        let workers = [worker(1, 250)];
-        let first = context("session-a");
-        let second = context("session-b");
-        let mut policy = policy(ThunderAgentConfig {
-            buffer_per_program: 100,
-            ..Default::default()
+    fn pending(classifier: &ThunderAgentClassifier, request_id: &str) -> PendingClassification {
+        let notify = classifier
+            .inner
+            .state
+            .lock()
+            .requests
+            .get(request_id)
+            .map(|request| Arc::clone(&request.notify))
+            .unwrap();
+        PendingClassification::new(Arc::clone(&classifier.inner), request_id.to_owned(), notify)
+    }
+
+    fn sent(classifier: &mut ThunderAgentClassifier, request_id: &str, worker: u64) {
+        classifier.on_event(ClassifyEvent::Sent {
+            request_id,
+            worker: WorkerWithDpRank::new(worker, 0),
         });
-        assert_eq!(
-            policy.admit(request(1, "request-1", Some(&first), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        assert_eq!(
-            policy.admit(request(2, "request-2", Some(&second), &workers, 100)),
-            QueueAdmissionDecision::Defer
-        );
     }
 
-    #[test]
-    fn admission_ignores_request_ineligible_workers() {
-        let workers = [
-            QueueAdmissionWorker::new(WorkerWithDpRank::new(1, 0), Some(1_000), true, false),
-            worker(2, 1_000),
-        ];
-        let session = context("session-a");
-        let mut policy = policy(Default::default());
-
-        assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        assert_eq!(
-            policy.programs["session-a"].assigned_worker,
-            Some(WorkerWithDpRank::new(2, 0))
-        );
-    }
-
-    #[test]
-    fn aborted_request_rolls_back_new_program() {
-        let workers = [worker(1, 1_000)];
-        let session = context("session-a");
-        let mut policy = policy(Default::default());
-        assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Aborted {
-                request_id: "request-1",
-            },
-            &mut Vec::new(),
-        );
-        assert!(!policy.programs.contains_key("session-a"));
-    }
-
-    #[test]
-    fn sessionless_request_bypasses_without_state() {
-        let workers = [worker(1, 1_000)];
-        let mut policy = policy(Default::default());
-        assert_eq!(
-            policy.admit(request(1, "request-1", None, &workers, 100)),
-            QueueAdmissionDecision::Bypass
-        );
-        assert!(policy.programs.is_empty());
-        assert!(policy.requests.is_empty());
-    }
-
-    #[test]
-    fn reconcile_wakes_program_after_capacity_grows() {
-        let small = [worker(1, 250)];
-        let large = [worker(1, 500)];
-        let first = context("session-a");
-        let second = context("session-b");
-        let mut policy = policy(ThunderAgentConfig {
-            buffer_per_program: 100,
-            ..Default::default()
+    fn completed(classifier: &mut ThunderAgentClassifier, request_id: &str, tokens: usize) {
+        classifier.on_event(ClassifyEvent::Completed {
+            request_id,
+            worker: WorkerWithDpRank::new(1, 0),
+            context_tokens: Some(tokens),
         });
-        assert_eq!(
-            policy.admit(request(1, "request-1", Some(&first), &small, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        assert_eq!(
-            policy.admit(request(2, "request-2", Some(&second), &small, 100)),
-            QueueAdmissionDecision::Defer
-        );
+    }
 
-        policy.next_tick = Instant::now();
-        let mut ready = Vec::new();
-        policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &large },
-            &mut ready,
-        );
-        assert_eq!(ready, [QueueAdmissionId::new(2)]);
+    #[test]
+    fn implements_request_classifier() {
+        fn assert_classifier<T: RequestClassifier>() {}
+        assert_classifier::<ThunderAgentClassifier>();
+    }
+
+    #[tokio::test]
+    async fn serializes_requests_for_one_session() {
+        let mut classifier = classifier(&[(1, 1_000)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-a", 100, false);
+
+        let second = tokio::spawn(await_release(pending(&classifier, "request-2"), ()));
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+
+        completed(&mut classifier, "request-1", 150);
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn selects_least_used_worker_with_capacity() {
+        let classifier = classifier(&[(1, 300), (2, 1_000)]);
+        register(&classifier, "request-1", "session-a", 250, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-b", 100, false);
+        release(&classifier, "request-2").await;
+
+        let state = classifier.inner.state.lock();
         assert_eq!(
-            policy.programs["session-b"].assigned_worker,
+            state.programs["session-a"].assigned_worker,
             Some(WorkerWithDpRank::new(1, 0))
         );
-    }
-
-    #[test]
-    fn dispatch_records_actual_worker_for_next_turn() {
-        let workers = [worker(1, 1_000), worker(2, 1_000)];
-        let session = context("session-a");
-        let mut policy = policy(Default::default());
         assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Dispatched {
-                id: QueueAdmissionId::new(1),
-                worker: WorkerWithDpRank::new(2, 0),
-            },
-            &mut Vec::new(),
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Completed {
-                request_id: "request-1",
-                context_tokens: Some(150),
-            },
-            &mut Vec::new(),
-        );
-        assert_eq!(policy.programs["session-a"].token_total, 150);
-        assert_eq!(
-            policy.admit(request(2, "request-2", Some(&session), &workers, 100)),
-            QueueAdmissionDecision::Ready
-        );
-        assert_eq!(
-            policy.programs["session-a"].assigned_worker,
+            state.programs["session-b"].assigned_worker,
             Some(WorkerWithDpRank::new(2, 0))
         );
     }
 
-    #[test]
-    fn pressure_pauses_acting_program_and_capacity_resumes_it() {
-        let constrained = [worker(1, 500)];
-        let expanded = [worker(1, 1_000)];
-        let session = context("session-a");
-        let mut policy = policy(ThunderAgentConfig {
-            buffer_per_program: 100,
-            ..Default::default()
-        });
+    #[tokio::test]
+    async fn final_session_frees_capacity_for_a_paused_program() {
+        let mut classifier = classifier(&[(1, 250)]);
+        register(&classifier, "request-1", "session-a", 200, true);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-b", 100, false);
+
         assert_eq!(
-            policy.admit(request(1, "request-1", Some(&session), &constrained, 400,)),
-            QueueAdmissionDecision::Ready
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Dispatched {
-                id: QueueAdmissionId::new(1),
-                worker: WorkerWithDpRank::new(1, 0),
-            },
-            &mut Vec::new(),
-        );
-        policy.on_event(
-            QueueAdmissionEvent::Completed {
-                request_id: "request-1",
-                context_tokens: Some(400),
-            },
-            &mut Vec::new(),
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
         );
 
-        policy.next_tick = Instant::now();
-        policy.on_event(
-            QueueAdmissionEvent::Reconcile {
-                workers: &constrained,
+        completed(&mut classifier, "request-1", 200);
+        release(&classifier, "request-2").await;
+    }
+
+    #[tokio::test]
+    async fn capacity_growth_resumes_a_pending_program() {
+        let current = Arc::new(Mutex::new(capacities(&[(1, 250)])));
+        let provider: Arc<dyn WorkerCapacityProvider> = {
+            let current = Arc::clone(&current);
+            Arc::new(move || Arc::clone(&current.lock()))
+        };
+        let classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                buffer_per_program: 100,
+                ..config()
             },
-            &mut Vec::new(),
-        );
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-b", 100, false);
         assert_eq!(
-            policy.programs["session-a"].lifecycle,
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
+        );
+
+        *current.lock() = capacities(&[(1, 500)]);
+        release(&classifier, "request-2").await;
+    }
+
+    #[tokio::test]
+    async fn pressure_pauses_an_acting_program_and_capacity_resumes_it() {
+        let current = Arc::new(Mutex::new(capacities(&[(1, 500)])));
+        let provider: Arc<dyn WorkerCapacityProvider> = {
+            let current = Arc::clone(&current);
+            Arc::new(move || Arc::clone(&current.lock()))
+        };
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                buffer_per_program: 100,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+
+        register(&classifier, "request-1", "session-a", 400, false);
+        release(&classifier, "request-1").await;
+        completed(&mut classifier, "request-1", 400);
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].lifecycle,
             ProgramLifecycle::Paused
         );
 
-        policy.next_tick = Instant::now();
-        policy.on_event(
-            QueueAdmissionEvent::Reconcile { workers: &expanded },
-            &mut Vec::new(),
-        );
+        *current.lock() = capacities(&[(1, 1_000)]);
+        register(&classifier, "request-2", "session-a", 400, false);
+        release(&classifier, "request-2").await;
         assert_eq!(
-            policy.programs["session-a"].lifecycle,
+            classifier.inner.state.lock().programs["session-a"].lifecycle,
             ProgramLifecycle::Active
         );
+    }
+
+    #[tokio::test]
+    async fn sent_event_reconciles_the_actual_worker() {
+        let mut classifier = classifier(&[(1, 1_000), (2, 1_000)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 2);
+
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            Some(WorkerWithDpRank::new(2, 0))
+        );
+    }
+
+    #[tokio::test]
+    async fn live_worker_without_a_model_card_keeps_its_session_assignment() {
+        let worker_1 = WorkerWithDpRank::new(1, 0);
+        let worker_2 = WorkerWithDpRank::new(2, 0);
+        let current = Arc::new(Mutex::new(Arc::new(
+            WorkerCapacitySnapshot::new([(worker_1, 1_000), (worker_2, 1_000)])
+                .with_live_workers([worker_1, worker_2]),
+        )));
+        let provider: Arc<dyn WorkerCapacityProvider> = {
+            let current = Arc::clone(&current);
+            Arc::new(move || Arc::clone(&current.lock()))
+        };
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            config(),
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        completed(&mut classifier, "request-1", 100);
+
+        *current.lock() = Arc::new(
+            WorkerCapacitySnapshot::new([(worker_2, 1_000)])
+                .with_live_workers([worker_1, worker_2]),
+        );
+        register(&classifier, "request-2", "session-a", 100, false);
+        release(&classifier, "request-2").await;
+
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            Some(worker_1)
+        );
+
+        completed(&mut classifier, "request-2", 100);
+        *current.lock() = Arc::new(
+            WorkerCapacitySnapshot::new([(worker_2, 1_000)]).with_live_workers([worker_2]),
+        );
+        register(&classifier, "request-3", "session-a", 100, false);
+        release(&classifier, "request-3").await;
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            Some(worker_2)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_capacity_card_is_not_used_for_assignment() {
+        let worker_1 = WorkerWithDpRank::new(1, 0);
+        let worker_2 = WorkerWithDpRank::new(2, 0);
+        let snapshot = Arc::new(
+            WorkerCapacitySnapshot::new([(worker_1, 1_000), (worker_2, 1_000)])
+                .with_live_workers([worker_2]),
+        );
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let classifier = ThunderAgentClassifier::with_assignments(
+            config(),
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            Some(worker_2)
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_empty_liveness_clears_the_last_assignment() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let current = Arc::new(Mutex::new(Arc::new(
+            WorkerCapacitySnapshot::new([(worker, 1_000)]).with_live_workers([worker]),
+        )));
+        let provider: Arc<dyn WorkerCapacityProvider> = {
+            let current = Arc::clone(&current);
+            Arc::new(move || Arc::clone(&current.lock()))
+        };
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            config(),
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        completed(&mut classifier, "request-1", 100);
+
+        *current.lock() = Arc::new(
+            WorkerCapacitySnapshot::default()
+                .with_live_workers(std::iter::empty::<WorkerWithDpRank>()),
+        );
+        register(&classifier, "request-2", "session-a", 100, false);
+        release(&classifier, "request-2").await;
+
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_capacity_respects_pause_until_timeout() {
+        let worker = WorkerWithDpRank::new(1, 0);
+        let current = Arc::new(Mutex::new(Arc::new(
+            WorkerCapacitySnapshot::new([(worker, 250)]).with_live_workers([worker]),
+        )));
+        let provider: Arc<dyn WorkerCapacityProvider> = {
+            let current = Arc::clone(&current);
+            Arc::new(move || Arc::clone(&current.lock()))
+        };
+        let classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                buffer_per_program: 100,
+                resume_timeout_seconds: 0.02,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-b", 100, false);
+        assert_eq!(
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
+        );
+
+        *current.lock() = Arc::new(WorkerCapacitySnapshot::default().with_live_workers([worker]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            classifier.inner.state.lock().wait_status("request-2"),
+            WaitStatus::Waiting
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            release(&classifier, "request-2"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_session_expires_before_its_next_request() {
+        let snapshot = capacities(&[(1, 1_000)]);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                session_retention_seconds: 0.005,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        completed(&mut classifier, "request-1", 100);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        register(&classifier, "request-2", "session-a", 100, false);
+        release(&classifier, "request-2").await;
+
+        assert_eq!(
+            classifier.inner.state.lock().programs["session-a"].step_count,
+            1
+        );
+    }
+
+    #[test]
+    fn tracked_request_limit_is_enforced_before_allocating_state() {
+        let snapshot = capacities(&[(1, 1_000)]);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                max_tracked_requests: 1,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 100, false);
+
+        let result = classifier
+            .inner
+            .register("request-2".into(), "session-b".into(), 100, false);
+        assert!(matches!(
+            result,
+            Err(ThunderAgentError::RequestLimitExceeded { limit: 1 })
+        ));
+        assert_eq!(classifier.inner.state.lock().requests.len(), 1);
+    }
+
+    #[test]
+    fn only_one_pending_request_drives_periodic_reconciliation() {
+        let classifier = classifier(&[(1, 1)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        register(&classifier, "request-2", "session-b", 100, false);
+        register(&classifier, "request-3", "session-c", 100, false);
+        assert_eq!(
+            classifier.inner.state.lock().timer_owner.as_deref(),
+            Some("request-1")
+        );
+
+        drop(pending(&classifier, "request-1"));
+        assert_eq!(
+            classifier.inner.state.lock().timer_owner.as_deref(),
+            Some("request-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_programs_are_bounded_by_the_tracking_limit() {
+        let snapshot = capacities(&[(1, 1_000)]);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let mut classifier = ThunderAgentClassifier::with_assignments(
+            ThunderAgentConfig {
+                max_tracked_requests: 2,
+                ..config()
+            },
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        completed(&mut classifier, "request-1", 100);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        register(&classifier, "request-2", "session-b", 100, false);
+        release(&classifier, "request-2").await;
+        completed(&mut classifier, "request-2", 100);
+
+        register(&classifier, "request-3", "session-c", 100, false);
+        release(&classifier, "request-3").await;
+
+        let state = classifier.inner.state.lock();
+        assert_eq!(state.programs.len(), 2);
+        assert!(!state.programs.contains_key("session-a"));
+        assert!(state.programs.contains_key("session-b"));
+        assert!(state.programs.contains_key("session-c"));
+    }
+
+    #[test]
+    fn arrival_tombstones_are_compacted_amortized() {
+        let mut classifier = classifier(&[(1, 1_000)]);
+        for sequence in 0..2_000 {
+            let request_id = format!("request-{sequence}");
+            let session_id = format!("session-{sequence}");
+            register(&classifier, &request_id, &session_id, 1, true);
+            assert_eq!(
+                classifier.inner.state.lock().wait_status(&request_id),
+                WaitStatus::Released
+            );
+            completed(&mut classifier, &request_id, 1);
+        }
+
+        let state = classifier.inner.state.lock();
+        assert!(state.arrival_order.len() <= 256);
+        assert!(state.requests.is_empty());
+        assert!(state.programs.is_empty());
+    }
+
+    #[test]
+    fn releases_a_large_backlog_without_per_release_linear_removal() {
+        const REQUESTS: usize = 5_000;
+
+        let classifier = classifier(&[(1, 1)]);
+        for sequence in 0..REQUESTS {
+            register(
+                &classifier,
+                &format!("request-{sequence}"),
+                &format!("session-{sequence}"),
+                100,
+                false,
+            );
+        }
+
+        let expanded = capacities(&[(1, 1_000_000)]);
+        let mut state = classifier.inner.state.lock();
+        state.reconcile(&expanded, Instant::now());
+
+        assert_eq!(
+            (0..REQUESTS)
+                .filter(|sequence| {
+                    state.wait_status(&format!("request-{sequence}")) == WaitStatus::Released
+                })
+                .count(),
+            REQUESTS
+        );
+        assert!(state.arrival_order.len() <= 256);
+        assert!(state.timer_owner.is_none());
+    }
+
+    #[tokio::test]
+    async fn aborted_request_rolls_back_new_program() {
+        let mut classifier = classifier(&[(1, 1_000)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        classifier.on_event(ClassifyEvent::Aborted {
+            request_id: "request-1",
+            worker: None,
+            error: None,
+        });
+
+        let state = classifier.inner.state.lock();
+        assert!(!state.programs.contains_key("session-a"));
+        assert!(!state.requests.contains_key("request-1"));
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_classification_rolls_back_its_program() {
+        let classifier = classifier(&[(1, 100)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        register(&classifier, "request-2", "session-b", 100, false);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            await_release(pending(&classifier, "request-2"), ()),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let state = classifier.inner.state.lock();
+        assert!(!state.programs.contains_key("session-b"));
+        assert!(!state.requests.contains_key("request-2"));
+    }
+
+    #[test]
+    fn dropping_an_unpolled_classification_rolls_back_its_program() {
+        let classifier = classifier(&[(1, 100)]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        register(&classifier, "request-2", "session-b", 100, false);
+
+        let future = await_release(pending(&classifier, "request-2"), ());
+        drop(future);
+
+        let state = classifier.inner.state.lock();
+        assert!(!state.programs.contains_key("session-b"));
+        assert!(!state.requests.contains_key("request-2"));
+    }
+
+    #[tokio::test]
+    async fn timeout_forces_release_on_the_least_loaded_worker() {
+        let config = ThunderAgentConfig {
+            scheduler_interval_seconds: 0.005,
+            resume_timeout_seconds: 0.02,
+            session_retention_seconds: 1.0,
+            buffer_per_program: 0,
+            ..Default::default()
+        };
+        let snapshot = capacities(&[(1, 100)]);
+        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
+        let classifier = ThunderAgentClassifier::with_assignments(
+            config,
+            provider,
+            Arc::new(SessionAssignments::default()),
+        )
+        .unwrap();
+        register(&classifier, "request-1", "session-a", 200, false);
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            release(&classifier, "request-1"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_start_without_model_cards_flows_through() {
+        let classifier = classifier(&[]);
+        register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
     }
 }

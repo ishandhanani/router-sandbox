@@ -1,14 +1,17 @@
 [package]
 name = "thunderagent-dynamo-policy"
-description = "ThunderAgent session-aware admission and routing policy for Dynamo"
+description = "ThunderAgent program-aware request classifier for Dynamo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["standalone-selection"] }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-13891-request-classifier" }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tracing = "0.1"
+tokio = { version = "1", features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
