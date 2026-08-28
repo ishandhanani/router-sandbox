@@ -1,0 +1,7 @@
+worker_selection:
+  aggregated: sgl-router-cache-aware
+  prefill: sgl-router-cache-aware
+  decode: sgl-router-cache-aware
+  instances:
+    - name: sgl-router-cache-aware
+      type: sgl-router-cache-aware

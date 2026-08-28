@@ -3,6 +3,7 @@ members = [
     "crates/thunderagent",
     "crates/sticky-until-saturated",
     "crates/sglang-cache-aware",
+    "crates/sgl-router-cache-aware",
 ]
 resolver = "3"
 
