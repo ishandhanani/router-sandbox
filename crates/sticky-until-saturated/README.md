@@ -2,7 +2,7 @@
 
 `sticky-until-saturated-dynamo-policy` implements llm-d's [sticky-until-saturated token-aware routing strategy](https://llm-d.ai/blog/sticky-until-saturated-token-aware-routing) as a Dynamo worker-selection-policy catalog.
 
-It keeps requests on a worker that already has most of the prompt in device KV cache, until admitting a cache-cold worker is predicted to improve TTFT by more than the cache-miss cost.
+It keeps requests on a worker that already has most of the prompt in device KV cache, until the best cache-cold worker's estimated TTFT is lower by more than the configured penalty. It then restores every worker to the candidate set and selects by projected token load.
 
 ## Algorithm
 
@@ -20,30 +20,32 @@ The picker makes two passes over the eligible workers:
 
 1. A worker is **warm** when `R > 0` and `Oᵢ / R ≥ affinity_threshold`. The policy intentionally considers only device-resident KV blocks; host and disk cache tiers have different retrieval costs and are not folded into this binary test.
 2. It computes the projected prefill load for each worker: `Lᵢ = Pᵢ + max(R - Oᵢ, 0) × B`.
-3. It finds the lowest projected load among warm workers, `Lwarm`.
-4. A cold worker is admitted only when `Lᵢ < Lwarm - τ`, where the saturation margin is `τ = peak_prefill_tokens_per_second × max_ttft_penalty_ms / 1000`. The comparison is strict: equality remains sticky.
-5. From the admitted set, the policy chooses the lowest primary cost and breaks exact ties by Dynamo's stable worker key.
+3. It finds the least in-flight prefill load among warm workers, `Pwarm`, and among cold workers, `Pcold`.
+4. It keeps only warm workers unless `Pwarm - Pcold > τ`, where `τ = peak_prefill_tokens_per_second × max_ttft_penalty_ms / 1000`. The comparison is strict: equality remains sticky. If the gate opens, it restores the complete eligible set before scoring, exactly as LLM-D's affinity filter does.
+5. It selects the lowest primary cost from that set and breaks exact ties by Dynamo's stable worker key.
 
 ```mermaid
 flowchart TD
     A["Eligible workers"] --> B["Measure device overlap and load"]
     B --> C{"Any warm worker?"}
     C -- "No" --> D["All workers admitted"]
-    C -- "Yes" --> E["Find lowest warm projected prefill load"]
-    E --> F["Admit warm workers and cold workers below Lwarm - tau"]
-    D --> G["Choose lowest primary cost"]
-    F --> G
-    G --> H["Stable worker-key tie break"]
+    C -- "Yes" --> E["Find best warm and cold in-flight loads"]
+    E --> F{"Pwarm - Pcold > tau?"}
+    F -- "No" --> G["Keep warm workers"]
+    F -- "Yes" --> D
+    D --> I["Choose lowest primary cost"]
+    G --> I
+    I --> H["Stable worker-key tie break"]
 ```
 
-This is a global picker rather than a candidate-table filter. A cold worker must remain visible until the picker compares its projected prefill load with the best warm worker, so it can return when the warm set saturates.
+This is a global picker rather than a candidate-table filter. It retains every worker until it has evaluated the same whole-set saturation gate as LLM-D.
 
 ### Pool-specific primary cost
 
 | Worker type | Primary selection cost | Saturation guard |
 | --- | --- | --- |
-| `prefill`, `aggregated` | Projected prefill load `Lᵢ` | Projected prefill load `Lᵢ` |
-| `decode`, `encode` | Active requests `Qᵢ` | Projected prefill load `Lᵢ` |
+| `prefill`, `aggregated` | Projected prefill load `Lᵢ` | Warm-cache filter gated by in-flight prefill load `Pᵢ` |
+| `decode`, `encode` | Active requests `Qᵢ` | None; every worker is scored |
 
 Prefill and aggregated pools fail closed when Dynamo is not tracking prefill tokens. Enable `--router-track-prefill-tokens` for those pools.
 
@@ -55,9 +57,11 @@ The included [`worker-selection.yaml`](worker-selection.yaml) uses the article-a
 | --- | ---: | --- |
 | `affinity_threshold` | `0.8` | Device-cache fraction required for the warm set |
 | `peak_prefill_tokens_per_second` | `15928.0` | Peak prefill throughput used to convert the TTFT budget to tokens |
-| `max_ttft_penalty_ms` | `18000` | Maximum cache-miss TTFT penalty |
+| `max_ttft_penalty_ms` | `18000` | Maximum cache-miss TTFT penalty; `0` always keeps the warm set |
 
-With the defaults, `τ = 286,704` tokens. Smaller values re-admit cold workers sooner; larger values preserve cache affinity for longer.
+With the defaults, `τ = 286,704` tokens. Smaller values open the full candidate set sooner; larger values preserve cache affinity for longer.
+
+The policy maps LLM-D's per-endpoint prefix match to Dynamo's device-resident KV overlap and its in-flight token counter to Dynamo's active prefill tokens. LLM-D randomizes exact max-score ties; this policy deliberately uses Dynamo's stable worker-key tie break for reproducibility.
 
 The crate registers the policy type `sticky-until-saturated`. Link it as Dynamo's `dynamo-worker-selection-policy-catalog` dependency, or call [`register`](src/lib.rs) from a combined catalog.
 

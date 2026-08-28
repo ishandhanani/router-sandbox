@@ -17,7 +17,7 @@ pub enum ConfigError {
 /// Parameters for the sticky-until-saturated worker-selection policy.
 ///
 /// `peak_prefill_tokens_per_second * max_ttft_penalty_ms / 1000` is the
-/// cold-worker admission margin, in tokens.
+/// affinity-break margin, in tokens.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StickyUntilSaturatedConfig {
@@ -49,9 +49,6 @@ impl StickyUntilSaturatedConfig {
             return Err(ConfigError::Invalid(
                 "peak_prefill_tokens_per_second must be finite and positive",
             ));
-        }
-        if self.max_ttft_penalty_ms == 0 {
-            return Err(ConfigError::Invalid("max_ttft_penalty_ms must be positive"));
         }
         if !self.saturation_tokens().is_finite() {
             return Err(ConfigError::Invalid(
@@ -103,7 +100,7 @@ mod tests {
                 ..Default::default()
             }
             .validate()
-            .is_err()
+            .is_ok()
         );
         assert!(
             StickyUntilSaturatedConfig {
