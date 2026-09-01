@@ -2,7 +2,7 @@
 
 `thunderagent-dynamo-policy` implements ThunderAgent's program-aware flow control on Dynamo's asynchronous request-classifier API. The crate owns the program table and keeps a classifier future pending while its program is paused. Dynamo continues to own request storage, queue ordering, overload rejection, worker eligibility, and dispatch.
 
-This prototype is stacked on [ai-dynamo/dynamo#13896](https://github.com/ai-dynamo/dynamo/pull/13896).
+This prototype is stacked on [ai-dynamo/dynamo#14123](https://github.com/ai-dynamo/dynamo/pull/14123).
 
 ## Algorithm
 

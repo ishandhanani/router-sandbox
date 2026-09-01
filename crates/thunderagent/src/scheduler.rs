@@ -846,7 +846,7 @@ impl State {
             ClassifyEvent::Aborted { request_id, .. } => {
                 self.finish_request(request_id, false, None, capacities, now)
             }
-            ClassifyEvent::Received { .. } | ClassifyEvent::Responding { .. } => false,
+            ClassifyEvent::Responding { .. } => false,
             _ => false,
         }
     }

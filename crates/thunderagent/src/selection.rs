@@ -150,6 +150,7 @@ mod tests {
                 None,
                 None,
             )),
+            affinity_target: None,
             overlap: OverlapSignals::default(),
             router_hint_candidates: None,
             retain_router_hint_chain: false,

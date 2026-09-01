@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use dynamo_kv_router::scheduling::{
-    ClassifyError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
+    ClassifierError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -182,6 +183,7 @@ impl ThunderAgentClassifier {
     }
 }
 
+#[async_trait]
 impl RequestClassifier for ThunderAgentClassifier {
     fn classify(&mut self, request: ClassifyRequest) -> ClassifyFuture {
         let Some(session) = request.session_context() else {
@@ -189,7 +191,7 @@ impl RequestClassifier for ThunderAgentClassifier {
         };
         let Some(request_id) = request.request_id().map(str::to_owned) else {
             return Box::pin(async move {
-                Err(Box::new(ThunderAgentError::MissingRequestId) as Box<ClassifyError>)
+                Err(Box::new(ThunderAgentError::MissingRequestId) as Box<ClassifierError>)
             });
         };
         let session_id = session.session_id().to_owned();
@@ -202,7 +204,7 @@ impl RequestClassifier for ThunderAgentClassifier {
             {
                 Ok(notify) => notify,
                 Err(error) => {
-                    return Box::pin(async move { Err(Box::new(error) as Box<ClassifyError>) });
+                    return Box::pin(async move { Err(Box::new(error) as Box<ClassifierError>) });
                 }
             };
 
@@ -211,11 +213,11 @@ impl RequestClassifier for ThunderAgentClassifier {
         Box::pin(async move {
             await_release(pending, request)
                 .await
-                .map_err(|error| Box::new(error) as Box<ClassifyError>)
+                .map_err(|error| Box::new(error) as Box<ClassifierError>)
         })
     }
 
-    fn on_event(&mut self, event: ClassifyEvent<'_>) {
+    async fn on_event(&mut self, event: ClassifyEvent<'_>) {
         self.inner.on_event(event);
     }
 }
@@ -293,19 +295,23 @@ mod tests {
         PendingClassification::new(Arc::clone(&classifier.inner), request_id.to_owned(), notify)
     }
 
-    fn sent(classifier: &mut ThunderAgentClassifier, request_id: &str, worker: u64) {
-        classifier.on_event(ClassifyEvent::Sent {
-            request_id,
-            worker: WorkerWithDpRank::new(worker, 0),
-        });
+    async fn sent(classifier: &mut ThunderAgentClassifier, request_id: &str, worker: u64) {
+        classifier
+            .on_event(ClassifyEvent::Sent {
+                request_id,
+                worker: WorkerWithDpRank::new(worker, 0),
+            })
+            .await;
     }
 
-    fn completed(classifier: &mut ThunderAgentClassifier, request_id: &str, tokens: usize) {
-        classifier.on_event(ClassifyEvent::Completed {
-            request_id,
-            worker: WorkerWithDpRank::new(1, 0),
-            context_tokens: Some(tokens),
-        });
+    async fn completed(classifier: &mut ThunderAgentClassifier, request_id: &str, tokens: usize) {
+        classifier
+            .on_event(ClassifyEvent::Completed {
+                request_id,
+                worker: WorkerWithDpRank::new(1, 0),
+                context_tokens: Some(tokens),
+            })
+            .await;
     }
 
     #[test]
@@ -325,7 +331,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!second.is_finished());
 
-        completed(&mut classifier, "request-1", 150);
+        completed(&mut classifier, "request-1", 150).await;
         second.await.unwrap().unwrap();
     }
 
@@ -363,7 +369,7 @@ mod tests {
         .unwrap();
         register(&classifier, "request-1", "session-a", 200, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 200);
+        completed(&mut classifier, "request-1", 200).await;
 
         register(&classifier, "request-2", "session-b", 100, false);
         assert_eq!(
@@ -394,11 +400,13 @@ mod tests {
             .reconcile(&capacity, Instant::now());
         release(&classifier, "request-2").await;
 
-        classifier.on_event(ClassifyEvent::Aborted {
-            request_id: "request-3",
-            worker: Some(WorkerWithDpRank::new(1, 0)),
-            error: None,
-        });
+        classifier
+            .on_event(ClassifyEvent::Aborted {
+                request_id: "request-3",
+                worker: Some(WorkerWithDpRank::new(1, 0)),
+                error: None,
+            })
+            .await;
         assert!(
             !classifier
                 .inner
@@ -429,7 +437,7 @@ mod tests {
                 .contains_key("session-a")
         );
 
-        completed(&mut classifier, "request-1", 150);
+        completed(&mut classifier, "request-1", 150).await;
         release(&classifier, "request-2").await;
         assert!(
             !classifier
@@ -490,7 +498,7 @@ mod tests {
 
         register(&classifier, "request-1", "session-a", 400, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 400);
+        completed(&mut classifier, "request-1", 400).await;
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].lifecycle,
             ProgramLifecycle::Active
@@ -527,7 +535,7 @@ mod tests {
         let mut classifier = classifier(&[(1, 1_000), (2, 1_000)]);
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        sent(&mut classifier, "request-1", 2);
+        sent(&mut classifier, "request-1", 2).await;
 
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].assigned_worker,
@@ -555,7 +563,7 @@ mod tests {
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 100);
+        completed(&mut classifier, "request-1", 100).await;
 
         *current.lock() = Arc::new(
             WorkerCapacitySnapshot::new([(worker_2, 1_000)])
@@ -569,7 +577,7 @@ mod tests {
             Some(worker_1)
         );
 
-        completed(&mut classifier, "request-2", 100);
+        completed(&mut classifier, "request-2", 100).await;
         *current.lock() = Arc::new(
             WorkerCapacitySnapshot::new([(worker_2, 1_000)]).with_live_workers([worker_2]),
         );
@@ -624,7 +632,7 @@ mod tests {
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 100);
+        completed(&mut classifier, "request-1", 100).await;
 
         *current.lock() = Arc::new(
             WorkerCapacitySnapshot::default()
@@ -697,7 +705,7 @@ mod tests {
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 100);
+        completed(&mut classifier, "request-1", 100).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         register(&classifier, "request-2", "session-a", 100, false);
@@ -750,11 +758,11 @@ mod tests {
 
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        completed(&mut classifier, "request-1", 100);
+        completed(&mut classifier, "request-1", 100).await;
         tokio::time::sleep(Duration::from_millis(1)).await;
         register(&classifier, "request-2", "session-b", 100, false);
         release(&classifier, "request-2").await;
-        completed(&mut classifier, "request-2", 100);
+        completed(&mut classifier, "request-2", 100).await;
 
         register(&classifier, "request-3", "session-c", 100, false);
         release(&classifier, "request-3").await;
@@ -766,8 +774,8 @@ mod tests {
         assert!(state.programs.contains_key("session-c"));
     }
 
-    #[test]
-    fn arrival_tombstones_are_compacted_amortized() {
+    #[tokio::test]
+    async fn arrival_tombstones_are_compacted_amortized() {
         let mut classifier = classifier(&[(1, 1_000)]);
         for sequence in 0..2_000 {
             let request_id = format!("request-{sequence}");
@@ -777,7 +785,7 @@ mod tests {
                 classifier.inner.state.lock().wait_status(&request_id),
                 WaitStatus::Released
             );
-            completed(&mut classifier, &request_id, 1);
+            completed(&mut classifier, &request_id, 1).await;
         }
 
         let state = classifier.inner.state.lock();
@@ -821,11 +829,13 @@ mod tests {
         let mut classifier = classifier(&[(1, 1_000)]);
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
-        classifier.on_event(ClassifyEvent::Aborted {
-            request_id: "request-1",
-            worker: None,
-            error: None,
-        });
+        classifier
+            .on_event(ClassifyEvent::Aborted {
+                request_id: "request-1",
+                worker: None,
+                error: None,
+            })
+            .await;
 
         let state = classifier.inner.state.lock();
         assert!(!state.programs.contains_key("session-a"));
