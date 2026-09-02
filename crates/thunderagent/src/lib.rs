@@ -5,7 +5,6 @@ mod capacity;
 mod config;
 mod policy;
 mod scheduler;
-mod selection;
 
 pub use capacity::{WorkerCapacityProvider, WorkerCapacitySnapshot};
 pub use config::{ConfigError, ThunderAgentConfig};
@@ -13,62 +12,99 @@ pub use policy::ThunderAgentClassifier;
 
 use std::sync::Arc;
 
-use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy};
+use dynamo_kv_router::scheduling::{
+    RequestClassifierContext, RequestClassifierFactory, RequestClassifierParameters,
+    RequestClassifierProviderError, RequestClassifierRegistry, RequestClassifierRegistryError,
+};
+use dynamo_kv_router::services::selection::{
+    WorkerSelectionPolicyRegistry, WorkerSelectionPolicyRegistryError,
+};
 
-use selection::{SessionAssignments, ThunderAgentPicker, ThunderAgentScorer};
+pub const THUNDERAGENT_CLASSIFIER_TYPE: &str = "thunderagent";
 
-/// Classifier and worker-selection components sharing ThunderAgent's session assignments.
-pub struct ThunderAgentComponents {
-    pub classifier: ThunderAgentClassifier,
-    pub worker_selection_policy: WorkerSelectionPolicy,
+fn capacity_provider(context: RequestClassifierContext) -> Arc<dyn WorkerCapacityProvider> {
+    let block_size = u64::from(context.block_size());
+    Arc::new(move || {
+        let workers = context.workers();
+        let live_workers = workers.iter().map(|worker| worker.worker());
+        let capacities = workers.iter().filter_map(|worker| {
+            let total_kv_blocks = worker.total_kv_blocks()?;
+            let capacity = total_kv_blocks.saturating_mul(block_size);
+            Some((
+                worker.worker(),
+                usize::try_from(capacity).unwrap_or(usize::MAX),
+            ))
+        });
+        Arc::new(WorkerCapacitySnapshot::new(capacities).with_live_workers(live_workers))
+    })
 }
 
-impl ThunderAgentComponents {
-    pub fn new(
-        kv_router_config: KvRouterConfig,
-        worker_label: &'static str,
-        config: ThunderAgentConfig,
-        capacity_provider: Arc<dyn WorkerCapacityProvider>,
-    ) -> Result<Self, ConfigError> {
-        let assignments = Arc::new(SessionAssignments::default());
-        let classifier = ThunderAgentClassifier::with_assignments(
-            config,
-            capacity_provider,
-            Arc::clone(&assignments),
-        )?;
-        let worker_selection_policy = WorkerSelectionPolicy::new(
-            kv_router_config,
-            worker_label,
-            vec![Box::new(ThunderAgentScorer)],
-            Box::new(ThunderAgentPicker::new(assignments)),
-        );
-        Ok(Self {
-            classifier,
-            worker_selection_policy,
-        })
-    }
+fn classifier_provider(
+    parameters: &RequestClassifierParameters,
+) -> Result<RequestClassifierFactory, RequestClassifierProviderError> {
+    let config: ThunderAgentConfig = parameters.deserialize()?;
+    config
+        .validate()
+        .map_err(|error| RequestClassifierProviderError::new(error.to_string()))?;
+
+    Ok(Arc::new(move |context| {
+        let capacity_provider = capacity_provider(context);
+        Box::new(
+            ThunderAgentClassifier::new(config.clone(), capacity_provider)
+                .expect("ThunderAgent configuration was validated during catalog resolution"),
+        )
+    }))
+}
+
+/// Keep Dynamo's built-in worker selector, including its hard/soft session-affinity handling.
+pub fn register(
+    _registry: &mut WorkerSelectionPolicyRegistry,
+) -> Result<(), WorkerSelectionPolicyRegistryError> {
+    Ok(())
+}
+
+/// Register ThunderAgent as a statically linked request-classifier plugin.
+pub fn register_request_classifiers(
+    registry: &mut RequestClassifierRegistry,
+) -> Result<(), RequestClassifierRegistryError> {
+    registry.register(THUNDERAGENT_CLASSIFIER_TYPE, Arc::new(classifier_provider))
 }
 
 #[cfg(test)]
 mod tests {
-    use dynamo_kv_router::scheduling::RequestClassifier;
+    use dynamo_kv_router::protocols::WorkerWithDpRank;
+    use dynamo_kv_router::scheduling::RequestClassifierWorker;
 
     use super::*;
 
     #[test]
-    fn constructs_classifier_and_worker_selection_together() {
-        let snapshot = Arc::new(WorkerCapacitySnapshot::default());
-        let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let components = ThunderAgentComponents::new(
-            KvRouterConfig::default(),
-            "generate",
-            ThunderAgentConfig::default(),
-            provider,
-        )
-        .unwrap();
+    fn registers_only_a_request_classifier() {
+        let mut worker_registry = WorkerSelectionPolicyRegistry::default();
+        register(&mut worker_registry).unwrap();
+        assert!(worker_registry.is_empty());
 
-        fn assert_classifier<T: RequestClassifier>(_classifier: &T) {}
-        assert_classifier(&components.classifier);
-        let _ = components.worker_selection_policy;
+        let mut classifier_registry = RequestClassifierRegistry::default();
+        register_request_classifiers(&mut classifier_registry).unwrap();
+        assert!(!classifier_registry.is_empty());
+    }
+
+    #[test]
+    fn derives_capacity_and_liveness_from_the_host_context() {
+        let worker_with_capacity = WorkerWithDpRank::new(1, 0);
+        let worker_without_capacity = WorkerWithDpRank::new(2, 0);
+        let context = RequestClassifierContext::new(16, move || {
+            vec![
+                RequestClassifierWorker::new(worker_with_capacity, Some(10)),
+                RequestClassifierWorker::new(worker_without_capacity, None),
+            ]
+        });
+
+        let snapshot = capacity_provider(context).snapshot();
+        assert_eq!(
+            snapshot.iter().collect::<Vec<_>>(),
+            [(worker_with_capacity, 160)]
+        );
+        assert!(snapshot.is_live(worker_with_capacity));
+        assert!(snapshot.is_live(worker_without_capacity));
     }
 }

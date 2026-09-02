@@ -13,7 +13,6 @@ use tokio::sync::Notify;
 use crate::ThunderAgentConfig;
 use crate::capacity::WorkerCapacitySnapshot;
 use crate::policy::ThunderAgentError;
-use crate::selection::SessionAssignments;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProgramStatus {
@@ -87,24 +86,20 @@ pub(crate) enum WaitStatus {
 #[derive(Default, Clone, Copy)]
 struct WorkerUsage {
     used: usize,
-    decayed: usize,
 }
 
 impl WorkerUsage {
-    fn add_program(&mut self, normal: usize, decayed: usize, buffer: usize) {
+    fn add_program(&mut self, normal: usize, buffer: usize) {
         self.used = self.used.saturating_add(normal).saturating_add(buffer);
-        self.decayed = self.decayed.saturating_add(decayed).saturating_add(buffer);
     }
 
-    fn remove_program(&mut self, normal: usize, decayed: usize, buffer: usize) {
+    fn remove_program(&mut self, normal: usize, buffer: usize) {
         self.used = self.used.saturating_sub(normal).saturating_sub(buffer);
-        self.decayed = self.decayed.saturating_sub(decayed).saturating_sub(buffer);
     }
 }
 
 pub(crate) struct State {
     config: ThunderAgentConfig,
-    assignments: Arc<SessionAssignments>,
     pub(crate) programs: HashMap<String, Program>,
     paused_programs: HashSet<String>,
     normal_usage: HashMap<WorkerWithDpRank, usize>,
@@ -117,10 +112,9 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn new(config: ThunderAgentConfig, assignments: Arc<SessionAssignments>) -> Self {
+    pub(crate) fn new(config: ThunderAgentConfig) -> Self {
         Self {
             config,
-            assignments,
             programs: HashMap::new(),
             paused_programs: HashSet::new(),
             normal_usage: HashMap::new(),
@@ -259,11 +253,10 @@ impl State {
             .and_then(|program| self.program_charge(program));
         self.subtract_charge(before);
         let result = update(self.programs.get_mut(session_id)?);
-        let (after, paused, assignment) = self.programs.get(session_id).map(|program| {
+        let (after, paused) = self.programs.get(session_id).map(|program| {
             (
                 self.program_charge(program),
                 program.lifecycle == ProgramLifecycle::Paused,
-                program.assigned_worker,
             )
         })?;
         self.add_charge(after);
@@ -272,21 +265,18 @@ impl State {
         } else {
             self.paused_programs.remove(session_id);
         }
-        self.assignments.set(session_id, assignment);
         Some(result)
     }
 
     fn insert_program(&mut self, session_id: String, program: Program) {
         let charge = self.program_charge(&program);
         let paused = program.lifecycle == ProgramLifecycle::Paused;
-        let assignment = program.assigned_worker;
         debug_assert!(!self.programs.contains_key(&session_id));
         self.programs.insert(session_id.clone(), program);
         self.add_charge(charge);
         if paused {
             self.paused_programs.insert(session_id.clone());
         }
-        self.assignments.set(&session_id, assignment);
     }
 
     fn remove_program(&mut self, session_id: &str) -> Option<Program> {
@@ -294,7 +284,6 @@ impl State {
         let charge = self.program_charge(&program);
         self.subtract_charge(charge);
         self.paused_programs.remove(session_id);
-        self.assignments.set(session_id, None);
         Some(program)
     }
 
@@ -307,10 +296,10 @@ impl State {
         let mut changed = self.expire_retained_programs(now);
         changed |= self.clear_removed_workers(capacities);
         changed |= self.admit_front_requests(capacities, now);
-        let mut usage = self.worker_usage(now);
-        changed |= self.greedy_resume(capacities, &mut usage, now);
+        let mut usage = self.worker_usage();
+        changed |= self.greedy_resume(capacities, &mut usage);
         changed |= self.force_timed_out(capacities, &mut usage, now);
-        changed |= self.pause_until_safe(capacities, &mut usage, now);
+        changed |= self.pause_until_safe(capacities, &mut usage);
         self.compact_arrival_order();
         changed
     }
@@ -381,16 +370,13 @@ impl State {
         }
 
         if !capacities.has_usable_capacity() {
-            return self.release_request(
-                request_id,
-                assigned_worker.filter(|worker| capacities.is_live(*worker)),
-            );
+            return self.release_request(request_id);
         }
 
         let mut changed = false;
         if let Some(worker) = assigned_worker {
             if capacities.is_live(worker) {
-                return self.release_request(request_id, Some(worker));
+                return self.release_request(request_id);
             }
             self.set_assignment(&session_id, None);
             changed = true;
@@ -401,21 +387,19 @@ impl State {
         }
 
         let required = self.request_cost(input_tokens);
-        let selected = capacities
+        let has_capacity = capacities
             .iter()
             .filter(|(worker, _)| capacities.is_live(*worker))
-            .filter_map(|(worker, capacity)| {
+            .any(|(worker, capacity)| {
                 let used = self.normal_usage.get(&worker).copied().unwrap_or(0);
                 capacity
                     .checked_sub(used)
                     .is_some_and(|remaining| remaining >= required)
-                    .then_some((worker, used))
-            })
-            .min_by_key(|(worker, used)| (*used, *worker))
-            .map(|(worker, _)| worker);
-        match selected {
-            Some(worker) => self.release_request(request_id, Some(worker)) || changed,
-            None => self.defer_program(&session_id, now) || changed,
+            });
+        if has_capacity {
+            self.release_request(request_id) || changed
+        } else {
+            self.defer_program(&session_id, now) || changed
         }
     }
 
@@ -427,17 +411,12 @@ impl State {
             return false;
         }
         let session_id = request.session_id.clone();
-        let assigned_worker = self
-            .programs
-            .get(&session_id)
-            .and_then(|program| program.assigned_worker);
-
         self.remove_program(&session_id);
         if let Some(request) = self.requests.get_mut(request_id) {
             request.prior_program = None;
             request.began_program = true;
         }
-        self.release_request(request_id, assigned_worker)
+        self.release_request(request_id)
     }
 
     fn begin_request(&mut self, request_id: &str) -> bool {
@@ -476,16 +455,14 @@ impl State {
         };
         let lifecycle_changed = program.lifecycle != ProgramLifecycle::Paused;
         let timer_changed = program.deferred_since.is_none();
-        let assignment_changed = program.assigned_worker.is_some();
         self.update_program(session_id, |program| {
             program.lifecycle = ProgramLifecycle::Paused;
             program.deferred_since.get_or_insert(now);
-            program.assigned_worker = None;
         });
-        lifecycle_changed || timer_changed || assignment_changed
+        lifecycle_changed || timer_changed
     }
 
-    fn release_request(&mut self, request_id: &str, worker: Option<WorkerWithDpRank>) -> bool {
+    fn release_request(&mut self, request_id: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
         };
@@ -497,14 +474,9 @@ impl State {
         }
         let session_id = request.session_id.clone();
         let session_final = request.session_final;
-        let program_assignment = self
-            .programs
-            .get(&session_id)
-            .and_then(|program| program.assigned_worker);
         if !session_final && !self.programs.contains_key(&session_id) {
             return false;
         }
-        let assigned_worker = worker.or(program_assignment);
         if self
             .sessions
             .get(&session_id)
@@ -515,13 +487,10 @@ impl State {
             return false;
         }
 
-        if session_final {
-            self.assignments.set(&session_id, assigned_worker);
-        } else {
+        if !session_final {
             self.update_program(&session_id, |program| {
                 program.lifecycle = ProgramLifecycle::Active;
                 program.deferred_since = None;
-                program.assigned_worker = assigned_worker;
             });
         }
 
@@ -546,7 +515,6 @@ impl State {
         &mut self,
         capacities: &WorkerCapacitySnapshot,
         usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
-        now: Instant,
     ) -> bool {
         let ceiling = (self.config.pause_threshold - self.config.resume_hysteresis).max(0.0);
         let mut remaining: Vec<(WorkerWithDpRank, usize)> = capacities
@@ -562,19 +530,12 @@ impl State {
         if remaining.is_empty() {
             return false;
         }
-        let original_remaining = remaining.clone();
-
         let mut paused: Vec<String> = self
             .paused_programs
             .iter()
             .filter(|session_id| self.programs.contains_key(*session_id))
             .cloned()
             .collect();
-        debug_assert!(
-            paused
-                .iter()
-                .all(|session_id| self.programs[session_id].assigned_worker.is_none())
-        );
         paused.sort_unstable_by(|left, right| {
             self.resume_group(left)
                 .cmp(&self.resume_group(right))
@@ -586,62 +547,28 @@ impl State {
                 .then_with(|| left.cmp(right))
         });
 
-        let total_capacity = remaining
-            .iter()
-            .map(|(_, available)| *available)
-            .fold(0usize, usize::saturating_add);
-        let mut cumulative = 0usize;
-        let mut selected = paused
-            .into_iter()
-            .filter_map(|session_id| {
-                let required = self.buffered_program_tokens(&session_id);
-                (cumulative.saturating_add(required) <= total_capacity).then(|| {
-                    cumulative = cumulative.saturating_add(required);
-                    (session_id, required)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        selected.sort_unstable_by(|(left, _), (right, _)| {
-            self.programs[right]
-                .token_total
-                .cmp(&self.programs[left].token_total)
-                .then_with(|| left.cmp(right))
-        });
-        let mut packed_capacity = original_remaining;
-        let mut assignments = HashMap::with_capacity(selected.len());
-        for (session_id, required) in &selected {
-            let Some(position) = packed_capacity
-                .iter()
-                .position(|(_, available)| *required <= *available)
-            else {
+        let mut changed = false;
+        for session_id in paused {
+            let required = self.buffered_program_tokens(&session_id);
+            let assigned_worker = self.programs[&session_id].assigned_worker;
+            let position = remaining.iter().position(|(worker, available)| {
+                assigned_worker.is_none_or(|assigned| assigned == *worker) && required <= *available
+            });
+            let Some(position) = position else {
                 continue;
             };
-            let worker = packed_capacity[position].0;
-            assignments.insert(session_id.clone(), worker);
+            let reserved_worker = remaining[position].0;
             reserve_capacity(
-                &mut packed_capacity,
+                &mut remaining,
                 position,
-                *required,
+                required,
                 self.config.buffer_per_program,
             );
-        }
-
-        let mut changed = false;
-        for (session_id, required) in selected {
-            let Some(&worker) = assignments.get(&session_id) else {
-                continue;
-            };
-            if self.resume_program(&session_id, Some(worker)) {
-                let Some(program) = self.programs.get(&session_id) else {
-                    continue;
-                };
-                let worker_usage = usage.entry(worker).or_default();
-                worker_usage.used = worker_usage.used.saturating_add(required);
-                worker_usage.decayed = worker_usage
-                    .decayed
-                    .saturating_add(self.program_tokens(program, true, now))
-                    .saturating_add(self.config.buffer_per_program);
+            if self.resume_program(&session_id) {
+                if assigned_worker == Some(reserved_worker) {
+                    let worker_usage = usage.entry(reserved_worker).or_default();
+                    worker_usage.used = worker_usage.used.saturating_add(required);
+                }
                 changed = true;
             }
         }
@@ -687,30 +614,17 @@ impl State {
 
         let mut changed = false;
         for session_id in timed_out {
-            let target = capacities
-                .iter()
-                .filter(|(worker, _)| capacities.is_live(*worker))
-                .max_by_key(|(worker, capacity)| {
-                    (
-                        *capacity as i128
-                            - usage.get(worker).map_or(0, |usage| usage.decayed) as i128,
-                        Reverse(*worker),
-                    )
-                })
-                .map(|(worker, _)| worker);
-            if target.is_none() && !capacities.has_live_worker() {
+            if !capacities.has_live_worker() {
                 continue;
             }
-            if self.resume_program(&session_id, target) {
-                if let Some(worker) = target {
-                    let Some(program) = self.programs.get(&session_id) else {
-                        continue;
-                    };
-                    usage.entry(worker).or_default().add_program(
-                        self.program_tokens(program, false, now),
-                        self.program_tokens(program, true, now),
-                        self.config.buffer_per_program,
-                    );
+            let assigned_worker = self.programs[&session_id].assigned_worker;
+            if self.resume_program(&session_id) {
+                if let Some(worker) = assigned_worker.filter(|worker| capacities.is_live(*worker)) {
+                    let program = &self.programs[&session_id];
+                    usage
+                        .entry(worker)
+                        .or_default()
+                        .add_program(self.program_tokens(program), self.config.buffer_per_program);
                 }
                 changed = true;
             }
@@ -718,7 +632,7 @@ impl State {
         changed
     }
 
-    fn resume_program(&mut self, session_id: &str, worker: Option<WorkerWithDpRank>) -> bool {
+    fn resume_program(&mut self, session_id: &str) -> bool {
         let Some(program) = self.programs.get(session_id) else {
             return false;
         };
@@ -728,7 +642,6 @@ impl State {
         self.update_program(session_id, |program| {
             program.lifecycle = ProgramLifecycle::Active;
             program.deferred_since = None;
-            program.assigned_worker = worker;
         });
 
         let pending = self.sessions.get(session_id).and_then(|session| {
@@ -739,7 +652,7 @@ impl State {
                 .flatten()
         });
         if let Some(request_id) = pending {
-            self.release_request(&request_id, worker);
+            self.release_request(&request_id);
         }
         true
     }
@@ -748,7 +661,6 @@ impl State {
         &mut self,
         capacities: &WorkerCapacitySnapshot,
         usage: &mut HashMap<WorkerWithDpRank, WorkerUsage>,
-        now: Instant,
     ) -> bool {
         let mut changed = false;
         for (worker, capacity) in capacities.iter() {
@@ -769,14 +681,12 @@ impl State {
                 let Some(program) = self.programs.get(&session_id) else {
                     continue;
                 };
-                let normal = self.program_tokens(program, false, now);
-                let decayed = self.program_tokens(program, true, now);
+                let normal = self.program_tokens(program);
                 if self.pause_acting(&session_id) {
-                    usage.entry(worker).or_default().remove_program(
-                        normal,
-                        decayed,
-                        self.config.buffer_per_program,
-                    );
+                    usage
+                        .entry(worker)
+                        .or_default()
+                        .remove_program(normal, self.config.buffer_per_program);
                     changed = true;
                 }
             }
@@ -808,7 +718,6 @@ impl State {
         }
         self.update_program(session_id, |program| {
             program.lifecycle = ProgramLifecycle::Paused;
-            program.assigned_worker = None;
         });
         true
     }
@@ -897,7 +806,6 @@ impl State {
 
         if request.session_final && request.began_program {
             self.remove_program(&request.session_id);
-            self.assignments.set(&request.session_id, None);
         } else if completed && request.phase == RequestPhase::Released {
             let pause = self
                 .update_program(&request.session_id, |program| {
@@ -1051,42 +959,18 @@ impl State {
         );
     }
 
-    fn worker_usage(&self, now: Instant) -> HashMap<WorkerWithDpRank, WorkerUsage> {
-        let mut usage = self.normal_worker_usage();
-        for program in self.programs.values() {
-            if program.lifecycle == ProgramLifecycle::Active
-                && let Some(worker) = program.assigned_worker
-            {
-                let decayed = self
-                    .program_tokens(program, true, now)
-                    .saturating_add(self.config.buffer_per_program);
-                let worker_usage = usage.entry(worker).or_default();
-                worker_usage.decayed = worker_usage.decayed.saturating_add(decayed);
-            }
-        }
-        usage
-    }
-
-    fn normal_worker_usage(&self) -> HashMap<WorkerWithDpRank, WorkerUsage> {
+    fn worker_usage(&self) -> HashMap<WorkerWithDpRank, WorkerUsage> {
         self.normal_usage
             .iter()
-            .map(|(&worker, &used)| (worker, WorkerUsage { used, decayed: 0 }))
+            .map(|(&worker, &used)| (worker, WorkerUsage { used }))
             .collect()
     }
 
-    fn program_tokens(&self, program: &Program, decayed: bool, now: Instant) -> usize {
+    fn program_tokens(&self, program: &Program) -> usize {
         if program.status != ProgramStatus::Acting {
             return program.token_total;
         }
-        let weight = if decayed {
-            let idle = program
-                .acting_since
-                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
-            2.0_f64.powf(-idle.as_secs_f64() / self.config.acting_decay_tau_seconds)
-        } else {
-            self.config.acting_token_weight
-        };
-        scale_tokens(program.token_total, weight)
+        scale_tokens(program.token_total, self.config.acting_token_weight)
     }
 
     fn request_cost(&self, input_tokens: usize) -> usize {
@@ -1150,7 +1034,7 @@ mod tests {
     use super::*;
 
     fn state(config: ThunderAgentConfig) -> State {
-        State::new(config, Arc::new(SessionAssignments::default()))
+        State::new(config)
     }
 
     fn capacities(values: &[(u64, usize)]) -> WorkerCapacitySnapshot {
@@ -1161,11 +1045,11 @@ mod tests {
         )
     }
 
-    fn paused_program(tokens: usize, now: Instant) -> Program {
+    fn paused_program(tokens: usize, worker: WorkerWithDpRank, now: Instant) -> Program {
         Program {
             status: ProgramStatus::Acting,
             lifecycle: ProgramLifecycle::Paused,
-            assigned_worker: None,
+            assigned_worker: Some(worker),
             token_total: tokens,
             step_count: 2,
             marked_for_pause: false,
@@ -1175,34 +1059,31 @@ mod tests {
     }
 
     #[test]
-    fn greedy_resume_selects_scalar_set_then_packs_largest_first() {
+    fn greedy_resume_preserves_affinity_assignments() {
         let now = Instant::now();
+        let worker_1 = WorkerWithDpRank::new(1, 0);
+        let worker_2 = WorkerWithDpRank::new(2, 0);
         let mut state = state(ThunderAgentConfig {
             pause_threshold: 1.0,
             resume_hysteresis: 0.0,
             buffer_per_program: 100,
             ..Default::default()
         });
-        for (session_id, tokens) in [("small", 1), ("medium", 100), ("large", 201)] {
-            state.insert_program(session_id.to_owned(), paused_program(tokens, now));
+        for (session_id, tokens, worker) in [
+            ("small", 1, worker_2),
+            ("medium", 100, worker_2),
+            ("large", 201, worker_1),
+        ] {
+            state.insert_program(session_id.to_owned(), paused_program(tokens, worker, now));
         }
         let capacities = capacities(&[(1, 301), (2, 301)]);
-        let mut usage = state.worker_usage(now);
+        let mut usage = state.worker_usage();
 
-        assert!(state.greedy_resume(&capacities, &mut usage, now));
+        assert!(state.greedy_resume(&capacities, &mut usage));
         assert!(state.paused_programs.is_empty());
-        assert_eq!(
-            state.programs["large"].assigned_worker,
-            Some(WorkerWithDpRank::new(1, 0))
-        );
-        assert_eq!(
-            state.programs["medium"].assigned_worker,
-            Some(WorkerWithDpRank::new(2, 0))
-        );
-        assert_eq!(
-            state.programs["small"].assigned_worker,
-            Some(WorkerWithDpRank::new(2, 0))
-        );
+        assert_eq!(state.programs["large"].assigned_worker, Some(worker_1));
+        assert_eq!(state.programs["medium"].assigned_worker, Some(worker_2));
+        assert_eq!(state.programs["small"].assigned_worker, Some(worker_2));
     }
 
     #[test]

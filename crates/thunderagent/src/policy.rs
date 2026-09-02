@@ -15,7 +15,6 @@ use tokio::sync::Notify;
 
 use crate::capacity::WorkerCapacityProvider;
 use crate::scheduler::{State, WaitStatus};
-use crate::selection::SessionAssignments;
 use crate::{ConfigError, ThunderAgentConfig};
 
 #[derive(Debug, Error)]
@@ -167,15 +166,14 @@ pub struct ThunderAgentClassifier {
 }
 
 impl ThunderAgentClassifier {
-    pub(crate) fn with_assignments(
+    pub fn new(
         config: ThunderAgentConfig,
         capacity_provider: Arc<dyn WorkerCapacityProvider>,
-        assignments: Arc<SessionAssignments>,
     ) -> Result<Self, ConfigError> {
         config.validate()?;
         Ok(Self {
             inner: Arc::new(Inner {
-                state: Mutex::new(State::new(config, assignments)),
+                state: Mutex::new(State::new(config)),
                 capacity_provider,
                 scheduler_started: AtomicBool::new(false),
             }),
@@ -251,12 +249,7 @@ mod tests {
     fn classifier(values: &[(u64, usize)]) -> ThunderAgentClassifier {
         let snapshot = capacities(values);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        ThunderAgentClassifier::with_assignments(
-            config(),
-            provider,
-            Arc::new(SessionAssignments::default()),
-        )
-        .unwrap()
+        ThunderAgentClassifier::new(config(), provider).unwrap()
     }
 
     fn register(
@@ -325,6 +318,7 @@ mod tests {
         let mut classifier = classifier(&[(1, 1_000)]);
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-a", 100, false);
 
         let second = tokio::spawn(await_release(pending(&classifier, "request-2"), ()));
@@ -336,20 +330,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selects_least_used_worker_with_capacity() {
-        let classifier = classifier(&[(1, 300), (2, 1_000)]);
+    async fn learns_the_affinity_worker_from_the_sent_event() {
+        let mut classifier = classifier(&[(1, 300), (2, 1_000)]);
         register(&classifier, "request-1", "session-a", 250, false);
         release(&classifier, "request-1").await;
-        register(&classifier, "request-2", "session-b", 100, false);
-        release(&classifier, "request-2").await;
-
-        let state = classifier.inner.state.lock();
         assert_eq!(
-            state.programs["session-a"].assigned_worker,
-            Some(WorkerWithDpRank::new(1, 0))
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
+            None
         );
+        sent(&mut classifier, "request-1", 2).await;
         assert_eq!(
-            state.programs["session-b"].assigned_worker,
+            classifier.inner.state.lock().programs["session-a"].assigned_worker,
             Some(WorkerWithDpRank::new(2, 0))
         );
     }
@@ -358,17 +349,17 @@ mod tests {
     async fn final_session_frees_capacity_at_admission_without_restoring_on_abort() {
         let snapshot = capacities(&[(1, 250)]);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let mut classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 scheduler_interval_seconds: 1.0,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
         register(&classifier, "request-1", "session-a", 200, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         completed(&mut classifier, "request-1", 200).await;
 
         register(&classifier, "request-2", "session-b", 100, false);
@@ -422,6 +413,7 @@ mod tests {
         let mut classifier = classifier(&[(1, 1_000)]);
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-a", 1, true);
 
         assert_eq!(
@@ -456,18 +448,18 @@ mod tests {
             let current = Arc::clone(&current);
             Arc::new(move || Arc::clone(&current.lock()))
         };
-        let classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 buffer_per_program: 100,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
 
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-b", 100, false);
         assert_eq!(
             classifier.inner.state.lock().wait_status("request-2"),
@@ -485,19 +477,19 @@ mod tests {
             let current = Arc::clone(&current);
             Arc::new(move || Arc::clone(&current.lock()))
         };
-        let mut classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 buffer_per_program: 100,
                 scheduler_interval_seconds: 0.05,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
 
         register(&classifier, "request-1", "session-a", 400, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         completed(&mut classifier, "request-1", 400).await;
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].lifecycle,
@@ -555,14 +547,10 @@ mod tests {
             let current = Arc::clone(&current);
             Arc::new(move || Arc::clone(&current.lock()))
         };
-        let mut classifier = ThunderAgentClassifier::with_assignments(
-            config(),
-            provider,
-            Arc::new(SessionAssignments::default()),
-        )
-        .unwrap();
+        let mut classifier = ThunderAgentClassifier::new(config(), provider).unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         completed(&mut classifier, "request-1", 100).await;
 
         *current.lock() = Arc::new(
@@ -583,6 +571,7 @@ mod tests {
         );
         register(&classifier, "request-3", "session-a", 100, false);
         release(&classifier, "request-3").await;
+        sent(&mut classifier, "request-3", 2).await;
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].assigned_worker,
             Some(worker_2)
@@ -598,15 +587,11 @@ mod tests {
                 .with_live_workers([worker_2]),
         );
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let classifier = ThunderAgentClassifier::with_assignments(
-            config(),
-            provider,
-            Arc::new(SessionAssignments::default()),
-        )
-        .unwrap();
+        let mut classifier = ThunderAgentClassifier::new(config(), provider).unwrap();
 
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 2).await;
 
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].assigned_worker,
@@ -624,14 +609,10 @@ mod tests {
             let current = Arc::clone(&current);
             Arc::new(move || Arc::clone(&current.lock()))
         };
-        let mut classifier = ThunderAgentClassifier::with_assignments(
-            config(),
-            provider,
-            Arc::new(SessionAssignments::default()),
-        )
-        .unwrap();
+        let mut classifier = ThunderAgentClassifier::new(config(), provider).unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         completed(&mut classifier, "request-1", 100).await;
 
         *current.lock() = Arc::new(
@@ -657,18 +638,18 @@ mod tests {
             let current = Arc::clone(&current);
             Arc::new(move || Arc::clone(&current.lock()))
         };
-        let classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 buffer_per_program: 100,
                 resume_timeout_seconds: 0.02,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-b", 100, false);
         assert_eq!(
             classifier.inner.state.lock().wait_status("request-2"),
@@ -694,17 +675,17 @@ mod tests {
     async fn retained_session_expires_before_its_next_request() {
         let snapshot = capacities(&[(1, 1_000)]);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let mut classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 session_retention_seconds: 0.005,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         completed(&mut classifier, "request-1", 100).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
@@ -721,13 +702,12 @@ mod tests {
     fn tracked_request_limit_is_enforced_before_allocating_state() {
         let snapshot = capacities(&[(1, 1_000)]);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let classifier = ThunderAgentClassifier::with_assignments(
+        let classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 max_tracked_requests: 1,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
@@ -746,13 +726,12 @@ mod tests {
     async fn retained_programs_are_bounded_by_the_tracking_limit() {
         let snapshot = capacities(&[(1, 1_000)]);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let mut classifier = ThunderAgentClassifier::with_assignments(
+        let mut classifier = ThunderAgentClassifier::new(
             ThunderAgentConfig {
                 max_tracked_requests: 2,
                 ..config()
             },
             provider,
-            Arc::new(SessionAssignments::default()),
         )
         .unwrap();
 
@@ -844,9 +823,10 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_pending_classification_rolls_back_its_program() {
-        let classifier = classifier(&[(1, 100)]);
+        let mut classifier = classifier(&[(1, 100)]);
         register(&classifier, "request-1", "session-a", 100, false);
         release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-b", 100, false);
 
         let result = tokio::time::timeout(
@@ -861,10 +841,12 @@ mod tests {
         assert!(!state.requests.contains_key("request-2"));
     }
 
-    #[test]
-    fn dropping_an_unpolled_classification_rolls_back_its_program() {
-        let classifier = classifier(&[(1, 100)]);
+    #[tokio::test]
+    async fn dropping_an_unpolled_classification_rolls_back_its_program() {
+        let mut classifier = classifier(&[(1, 100)]);
         register(&classifier, "request-1", "session-a", 100, false);
+        release(&classifier, "request-1").await;
+        sent(&mut classifier, "request-1", 1).await;
         register(&classifier, "request-2", "session-b", 100, false);
 
         let future = await_release(pending(&classifier, "request-2"), ());
@@ -876,7 +858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_forces_release_on_the_least_loaded_worker() {
+    async fn timeout_forces_release_without_changing_placement() {
         let config = ThunderAgentConfig {
             scheduler_interval_seconds: 0.005,
             resume_timeout_seconds: 0.02,
@@ -886,12 +868,7 @@ mod tests {
         };
         let snapshot = capacities(&[(1, 100)]);
         let provider: Arc<dyn WorkerCapacityProvider> = Arc::new(move || Arc::clone(&snapshot));
-        let classifier = ThunderAgentClassifier::with_assignments(
-            config,
-            provider,
-            Arc::new(SessionAssignments::default()),
-        )
-        .unwrap();
+        let classifier = ThunderAgentClassifier::new(config, provider).unwrap();
         register(&classifier, "request-1", "session-a", 200, false);
 
         tokio::time::timeout(
