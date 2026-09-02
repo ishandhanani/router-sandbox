@@ -84,6 +84,16 @@ pub(crate) enum WaitStatus {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StateTelemetry {
+    pub(crate) programs: usize,
+    pub(crate) active_programs: usize,
+    pub(crate) paused_programs: usize,
+    pub(crate) marked_for_pause: usize,
+    pub(crate) waiting_requests: usize,
+    pub(crate) tracked_requests: usize,
+}
+
 #[derive(Default, Clone, Copy)]
 struct WorkerUsage {
     used: usize,
@@ -186,6 +196,26 @@ impl State {
             Some(request) if request.phase == RequestPhase::Waiting => WaitStatus::Waiting,
             Some(request) => WaitStatus::Released(request.placement_target),
             None => WaitStatus::Missing,
+        }
+    }
+
+    pub(crate) fn telemetry(&self) -> StateTelemetry {
+        let paused_programs = self.paused_programs.len();
+        StateTelemetry {
+            programs: self.programs.len(),
+            active_programs: self.programs.len().saturating_sub(paused_programs),
+            paused_programs,
+            marked_for_pause: self
+                .programs
+                .values()
+                .filter(|program| program.marked_for_pause)
+                .count(),
+            waiting_requests: self
+                .requests
+                .values()
+                .filter(|request| request.phase == RequestPhase::Waiting)
+                .count(),
+            tracked_requests: self.requests.len(),
         }
     }
 

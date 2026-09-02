@@ -86,7 +86,23 @@ impl Inner {
             return;
         }
         let capacities = self.capacity_provider.snapshot();
-        self.state.lock().reconcile(&capacities, Instant::now());
+        let mut state = self.state.lock();
+        let before = state.telemetry();
+        let changed = state.reconcile(&capacities, Instant::now());
+        let after = state.telemetry();
+        tracing::info!(
+            target: "thunderagent",
+            changed,
+            programs = after.programs,
+            active_programs = after.active_programs,
+            paused_before = before.paused_programs,
+            paused_programs = after.paused_programs,
+            marked_before = before.marked_for_pause,
+            marked_for_pause = after.marked_for_pause,
+            waiting_requests = after.waiting_requests,
+            tracked_requests = after.tracked_requests,
+            "ThunderAgent reconcile"
+        );
     }
 
     fn on_event(&self, event: ClassifyEvent) {
