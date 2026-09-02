@@ -7,5 +7,6 @@ worker_selection:
       type: sticky-until-saturated
       parameters:
         affinity_threshold: 0.8
+        # LLM-D default proxy. Replace with a direct-worker preprofile result before benchmarking.
         peak_prefill_tokens_per_second: 15928.0
         max_ttft_penalty_ms: 18000

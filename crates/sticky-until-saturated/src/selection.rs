@@ -18,29 +18,45 @@ impl PrimaryLoad {
     fn requires_prefill_tracking(self) -> bool {
         self == Self::ProjectedPrefill
     }
+
+    fn uses_cache_affinity(self) -> bool {
+        self == Self::ProjectedPrefill
+    }
+
+    fn required_worker_inputs(self) -> WorkerInputs {
+        if self.uses_cache_affinity() {
+            WorkerInputs::LOAD | WorkerInputs::CACHE
+        } else {
+            WorkerInputs::LOAD
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct CandidateMetrics {
-    device_overlap_blocks: f64,
+    device_overlap_blocks: Option<f64>,
     active_prefill_tokens: usize,
     active_requests: usize,
 }
 
 impl CandidateMetrics {
-    fn from_candidate(candidate: &WorkerCandidate) -> Result<Self, WorkerSelectionPolicyError> {
-        let cache = candidate
-            .cache()
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?;
+    fn from_candidate(
+        candidate: &WorkerCandidate,
+        uses_cache_affinity: bool,
+    ) -> Result<Self, WorkerSelectionPolicyError> {
         let load = candidate
             .load()
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
-        let device_overlap_blocks = cache.device_overlap_blocks();
-        if !device_overlap_blocks.is_finite() || device_overlap_blocks < 0.0 {
-            return Err(WorkerSelectionPolicyError::failed(
-                "device overlap must be finite and non-negative",
-            ));
-        }
+        let device_overlap_blocks = if uses_cache_affinity {
+            Some(cache_overlap(
+                candidate
+                    .cache()
+                    .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?
+                    .device_overlap_blocks(),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             device_overlap_blocks,
             active_prefill_tokens: load.active_prefill_tokens(),
@@ -51,27 +67,38 @@ impl CandidateMetrics {
     fn from_picker_input(
         input: WorkerInputView<'_>,
         row: usize,
+        uses_cache_affinity: bool,
     ) -> Result<Self, WorkerSelectionPolicyError> {
-        let cache = input
-            .cache()
-            .and_then(|inputs| inputs.get(row))
-            .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?;
         let load = input
             .load()
             .and_then(|inputs| inputs.get(row))
             .ok_or_else(|| WorkerSelectionPolicyError::failed("load input unavailable"))?;
-        let device_overlap_blocks = cache.device_overlap_blocks();
-        if !device_overlap_blocks.is_finite() || device_overlap_blocks < 0.0 {
-            return Err(WorkerSelectionPolicyError::failed(
-                "device overlap must be finite and non-negative",
-            ));
-        }
+        let device_overlap_blocks = if uses_cache_affinity {
+            Some(cache_overlap(
+                input
+                    .cache()
+                    .and_then(|inputs| inputs.get(row))
+                    .ok_or_else(|| WorkerSelectionPolicyError::failed("cache input unavailable"))?
+                    .device_overlap_blocks(),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             device_overlap_blocks,
             active_prefill_tokens: load.active_prefill_tokens(),
             active_requests: load.active_requests(),
         })
     }
+}
+
+fn cache_overlap(device_overlap_blocks: f64) -> Result<f64, WorkerSelectionPolicyError> {
+    if !device_overlap_blocks.is_finite() || device_overlap_blocks < 0.0 {
+        return Err(WorkerSelectionPolicyError::failed(
+            "device overlap must be finite and non-negative",
+        ));
+    }
+    Ok(device_overlap_blocks)
 }
 
 /// Logs the primary, lower-is-better signal while the picker applies cache affinity globally.
@@ -87,7 +114,7 @@ impl StickyUntilSaturatedScorer {
 
 impl WorkerScorer for StickyUntilSaturatedScorer {
     fn required_worker_inputs(&self) -> WorkerInputs {
-        WorkerInputs::CACHE | WorkerInputs::LOAD
+        self.primary_load.required_worker_inputs()
     }
 
     fn score(
@@ -96,7 +123,8 @@ impl WorkerScorer for StickyUntilSaturatedScorer {
         candidate: &WorkerCandidate,
     ) -> Result<f64, WorkerSelectionPolicyError> {
         require_prefill_tracking(context, self.primary_load)?;
-        let metrics = CandidateMetrics::from_candidate(candidate)?;
+        let metrics =
+            CandidateMetrics::from_candidate(candidate, self.primary_load.uses_cache_affinity())?;
         primary_cost(context, metrics, self.primary_load)
     }
 }
@@ -118,7 +146,7 @@ impl StickyUntilSaturatedPicker {
 
 impl WorkerPicker for StickyUntilSaturatedPicker {
     fn required_worker_inputs(&self) -> WorkerInputs {
-        WorkerInputs::CACHE | WorkerInputs::LOAD
+        self.primary_load.required_worker_inputs()
     }
 
     fn pick(
@@ -128,26 +156,21 @@ impl WorkerPicker for StickyUntilSaturatedPicker {
     ) -> Result<usize, WorkerSelectionPolicyError> {
         require_prefill_tracking(context, self.primary_load)?;
         let candidates = input.candidates();
-        let mut best_warm_prefill: Option<f64> = None;
-        for row in 0..candidates.len() {
-            let metrics = CandidateMetrics::from_picker_input(input, row)?;
-            if is_warm(context, metrics, self.config.affinity_threshold) {
-                let projected_prefill = projected_prefill_tokens(context, metrics);
-                if best_warm_prefill.is_none_or(|best| projected_prefill < best) {
-                    best_warm_prefill = Some(projected_prefill);
-                }
-            }
-        }
+        let keep_sticky_set = if self.primary_load.uses_cache_affinity() {
+            sticky_set_is_eligible(context, input, &self.config)?
+        } else {
+            false
+        };
 
         let mut selected: Option<(usize, f64)> = None;
         for (row, candidate) in candidates.iter().enumerate() {
-            let metrics = CandidateMetrics::from_picker_input(input, row)?;
+            let metrics = CandidateMetrics::from_picker_input(
+                input,
+                row,
+                self.primary_load.uses_cache_affinity(),
+            )?;
             let warm = is_warm(context, metrics, self.config.affinity_threshold);
-            let projected_prefill = projected_prefill_tokens(context, metrics);
-            let eligible = best_warm_prefill.is_none_or(|best_warm| {
-                warm || projected_prefill < best_warm - self.config.saturation_tokens()
-            });
-            if !eligible {
+            if keep_sticky_set && !warm {
                 continue;
             }
 
@@ -166,6 +189,43 @@ impl WorkerPicker for StickyUntilSaturatedPicker {
             .map(|(row, _)| row)
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
+}
+
+/// Implements LLM-D's affinity filter before the token-load scorer runs:
+/// keep the warm set unless the *best* cold worker's current in-flight load
+/// beats the best warm worker by more than the configured TTFT margin. When
+/// the gate opens, LLM-D restores the entire candidate set, not only that
+/// particular cold worker.
+fn sticky_set_is_eligible(
+    context: &WorkerSelectionContext<'_>,
+    input: WorkerInputView<'_>,
+    config: &StickyUntilSaturatedConfig,
+) -> Result<bool, WorkerSelectionPolicyError> {
+    let mut best_warm_in_flight: Option<f64> = None;
+    let mut best_cold_in_flight: Option<f64> = None;
+    for row in 0..input.candidates().len() {
+        let metrics = CandidateMetrics::from_picker_input(input, row, true)?;
+        let in_flight = metrics.active_prefill_tokens as f64;
+        let best = if is_warm(context, metrics, config.affinity_threshold) {
+            &mut best_warm_in_flight
+        } else {
+            &mut best_cold_in_flight
+        };
+        if best.is_none_or(|current| in_flight < current) {
+            *best = Some(in_flight);
+        }
+    }
+
+    let Some(best_warm) = best_warm_in_flight else {
+        return Ok(false);
+    };
+    if config.max_ttft_penalty_ms == 0 {
+        return Ok(true);
+    }
+    let Some(best_cold) = best_cold_in_flight else {
+        return Ok(true);
+    };
+    Ok(best_warm - best_cold <= config.saturation_tokens())
 }
 
 fn require_prefill_tracking(
@@ -187,7 +247,9 @@ fn is_warm(
 ) -> bool {
     let request_blocks = context.request_blocks();
     request_blocks > 0
-        && metrics.device_overlap_blocks / request_blocks as f64 >= affinity_threshold
+        && metrics
+            .device_overlap_blocks
+            .is_some_and(|overlap| overlap / request_blocks as f64 >= affinity_threshold)
 }
 
 fn projected_prefill_tokens(
@@ -195,7 +257,7 @@ fn projected_prefill_tokens(
     metrics: CandidateMetrics,
 ) -> f64 {
     metrics.active_prefill_tokens as f64
-        + (context.request_blocks() as f64 - metrics.device_overlap_blocks).max(0.0)
+        + (context.request_blocks() as f64 - metrics.device_overlap_blocks.unwrap_or(0.0)).max(0.0)
             * context.block_size() as f64
 }
 
@@ -247,21 +309,27 @@ pub fn benchmark_prefill_pick_index(
         candidate.active_prefill_tokens as f64
             + (request_blocks as f64 - candidate.device_overlap_blocks).max(0.0) * block_size as f64
     };
-    let best_warm_prefill = candidates
+    let best_warm_in_flight = candidates
         .iter()
         .filter(|candidate| is_warm(candidate))
-        .map(projected_prefill)
+        .map(|candidate| candidate.active_prefill_tokens as f64)
         .min_by(f64::total_cmp);
+    let best_cold_in_flight = candidates
+        .iter()
+        .filter(|candidate| !is_warm(candidate))
+        .map(|candidate| candidate.active_prefill_tokens as f64)
+        .min_by(f64::total_cmp);
+    let keep_sticky_set = match best_warm_in_flight {
+        None => false,
+        Some(_) if config.max_ttft_penalty_ms == 0 => true,
+        Some(best_warm) => best_cold_in_flight
+            .is_none_or(|best_cold| best_warm - best_cold <= config.saturation_tokens()),
+    };
 
     candidates
         .iter()
         .enumerate()
-        .filter(|(_, candidate)| {
-            best_warm_prefill.is_none_or(|best_warm| {
-                is_warm(candidate)
-                    || projected_prefill(candidate) < best_warm - config.saturation_tokens()
-            })
-        })
+        .filter(|(_, candidate)| !keep_sticky_set || is_warm(candidate))
         .min_by(|(_, left), (_, right)| {
             projected_prefill(left)
                 .total_cmp(&projected_prefill(right))
@@ -301,29 +369,39 @@ mod tests {
         }
         let is_warm = |metrics: CandidateMetrics| {
             request_blocks > 0
-                && metrics.device_overlap_blocks / request_blocks as f64
-                    >= config.affinity_threshold
+                && metrics.device_overlap_blocks.is_some_and(|overlap| {
+                    overlap / request_blocks as f64 >= config.affinity_threshold
+                })
         };
         let projected_prefill = |metrics: CandidateMetrics| {
             metrics.active_prefill_tokens as f64
-                + (request_blocks as f64 - metrics.device_overlap_blocks).max(0.0)
+                + (request_blocks as f64 - metrics.device_overlap_blocks.unwrap_or(0.0)).max(0.0)
                     * block_size as f64
         };
-        let best_warm_prefill = candidates
-            .iter()
-            .filter(|candidate| is_warm(candidate.metrics))
-            .map(|candidate| projected_prefill(candidate.metrics))
-            .min_by(f64::total_cmp);
+        let keep_sticky_set = if primary_load.uses_cache_affinity() {
+            let best_warm_in_flight = candidates
+                .iter()
+                .filter(|candidate| is_warm(candidate.metrics))
+                .map(|candidate| candidate.metrics.active_prefill_tokens as f64)
+                .min_by(f64::total_cmp);
+            let best_cold_in_flight = candidates
+                .iter()
+                .filter(|candidate| !is_warm(candidate.metrics))
+                .map(|candidate| candidate.metrics.active_prefill_tokens as f64)
+                .min_by(f64::total_cmp);
+            match best_warm_in_flight {
+                None => false,
+                Some(_) if config.max_ttft_penalty_ms == 0 => true,
+                Some(best_warm) => best_cold_in_flight
+                    .is_none_or(|best_cold| best_warm - best_cold <= config.saturation_tokens()),
+            }
+        } else {
+            false
+        };
         candidates
             .iter()
             .enumerate()
-            .filter(|(_, candidate)| {
-                best_warm_prefill.is_none_or(|best_warm| {
-                    is_warm(candidate.metrics)
-                        || projected_prefill(candidate.metrics)
-                            < best_warm - config.saturation_tokens()
-                })
-            })
+            .filter(|(_, candidate)| !keep_sticky_set || is_warm(candidate.metrics))
             .min_by(|(_, left), (_, right)| {
                 let left_cost = match primary_load {
                     PrimaryLoad::ProjectedPrefill => projected_prefill(left.metrics),
@@ -350,7 +428,7 @@ mod tests {
         TestCandidate {
             key,
             metrics: CandidateMetrics {
-                device_overlap_blocks,
+                device_overlap_blocks: Some(device_overlap_blocks),
                 active_prefill_tokens,
                 active_requests,
             },
@@ -374,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn warm_worker_is_sticky_when_cold_worker_does_not_clear_margin() {
-        let candidates = [candidate(1, 8.0, 12, 1), candidate(2, 0.0, 0, 0)];
+    fn gate_keeps_warm_workers_when_ttft_penalty_is_not_exceeded() {
+        let candidates = [candidate(1, 8.0, 5, 1), candidate(2, 0.0, 0, 0)];
         assert_eq!(
             choose(
                 &test_config(5.0),
@@ -391,10 +469,10 @@ mod tests {
 
     #[test]
     fn saturation_margin_is_strict() {
-        let candidates = [candidate(1, 8.0, 12, 1), candidate(2, 0.0, 0, 0)];
+        let candidates = [candidate(1, 8.0, 5, 1), candidate(2, 0.0, 0, 0)];
         assert_eq!(
             choose(
-                &test_config(4.0),
+                &test_config(5.0),
                 PrimaryLoad::ProjectedPrefill,
                 10,
                 1,
@@ -422,22 +500,42 @@ mod tests {
     }
 
     #[test]
-    fn only_cold_workers_below_best_warm_margin_rejoin() {
+    fn load_escape_restores_full_candidate_set_before_scoring() {
         let candidates = [
-            candidate(1, 8.0, 20, 4),
+            candidate(1, 1_600.0, 1_000, 4),
             candidate(2, 0.0, 0, 0),
-            candidate(3, 0.0, 18, 0),
+            candidate(3, 1_599.0, 950, 0),
         ];
         assert_eq!(
             choose(
-                &test_config(2.0),
+                &test_config(100.0),
+                PrimaryLoad::ProjectedPrefill,
+                2_000,
+                1,
+                true,
+                &candidates
+            ),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn zero_ttft_penalty_always_keeps_the_warm_set() {
+        let candidates = [candidate(1, 8.0, 100, 1), candidate(2, 0.0, 0, 0)];
+        let config = StickyUntilSaturatedConfig {
+            max_ttft_penalty_ms: 0,
+            ..test_config(1.0)
+        };
+        assert_eq!(
+            choose(
+                &config,
                 PrimaryLoad::ProjectedPrefill,
                 10,
                 1,
                 true,
                 &candidates
             ),
-            Ok(1)
+            Ok(0)
         );
     }
 
