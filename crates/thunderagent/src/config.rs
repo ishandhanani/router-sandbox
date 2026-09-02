@@ -22,6 +22,7 @@ pub struct ThunderAgentConfig {
     pub session_retention_seconds: f64,
     pub scheduler_interval_seconds: f64,
     pub acting_token_weight: f64,
+    pub acting_decay_tau_seconds: f64,
     pub buffer_per_program: usize,
     pub max_tracked_requests: usize,
 }
@@ -36,6 +37,7 @@ impl Default for ThunderAgentConfig {
             session_retention_seconds: 1_800.0,
             scheduler_interval_seconds: 5.0,
             acting_token_weight: 1.0,
+            acting_decay_tau_seconds: 1.0,
             buffer_per_program: 100,
             max_tracked_requests: 10_000,
         }
@@ -75,6 +77,11 @@ impl ThunderAgentConfig {
         if !self.acting_token_weight.is_finite() || self.acting_token_weight <= 0.0 {
             return Err(ConfigError::Invalid(
                 "acting_token_weight must be finite and positive",
+            ));
+        }
+        if !self.acting_decay_tau_seconds.is_finite() || self.acting_decay_tau_seconds <= 0.0 {
+            return Err(ConfigError::Invalid(
+                "acting_decay_tau_seconds must be finite and positive",
             ));
         }
         if self.max_tracked_requests == 0 {

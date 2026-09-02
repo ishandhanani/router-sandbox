@@ -89,7 +89,7 @@ impl Inner {
         self.state.lock().reconcile(&capacities, Instant::now());
     }
 
-    fn on_event(&self, event: ClassifyEvent<'_>) {
+    fn on_event(&self, event: ClassifyEvent) {
         let capacities = self.capacity_provider.snapshot();
         self.state
             .lock()
@@ -137,7 +137,7 @@ impl Drop for PendingClassification {
 async fn await_release<T>(
     mut pending: PendingClassification,
     value: T,
-) -> Result<T, ThunderAgentError> {
+) -> Result<(T, Option<dynamo_kv_router::protocols::WorkerWithDpRank>), ThunderAgentError> {
     pending.inner.start_scheduler();
     let inner = Arc::clone(&pending.inner);
     let request_id = pending.request_id.clone();
@@ -146,9 +146,9 @@ async fn await_release<T>(
         let notified = notify.notified();
         let status = inner.state.lock().wait_status(&request_id);
         match status {
-            WaitStatus::Released => {
+            WaitStatus::Released(worker) => {
                 pending.disarm();
-                return Ok(value);
+                return Ok((value, worker));
             }
             WaitStatus::Missing => {
                 pending.disarm();
@@ -211,11 +211,17 @@ impl RequestClassifier for ThunderAgentClassifier {
         Box::pin(async move {
             await_release(pending, request)
                 .await
+                .map(|(mut request, worker)| {
+                    if let Some(worker) = worker {
+                        request.set_worker_selection_target(worker);
+                    }
+                    request
+                })
                 .map_err(|error| Box::new(error) as Box<ClassifierError>)
         })
     }
 
-    async fn on_event(&mut self, event: ClassifyEvent<'_>) {
+    async fn on_event(&mut self, event: ClassifyEvent) {
         self.inner.on_event(event);
     }
 }
@@ -291,7 +297,7 @@ mod tests {
     async fn sent(classifier: &mut ThunderAgentClassifier, request_id: &str, worker: u64) {
         classifier
             .on_event(ClassifyEvent::Sent {
-                request_id,
+                request_id: request_id.to_owned(),
                 worker: WorkerWithDpRank::new(worker, 0),
             })
             .await;
@@ -300,7 +306,7 @@ mod tests {
     async fn completed(classifier: &mut ThunderAgentClassifier, request_id: &str, tokens: usize) {
         classifier
             .on_event(ClassifyEvent::Completed {
-                request_id,
+                request_id: request_id.to_owned(),
                 worker: WorkerWithDpRank::new(1, 0),
                 context_tokens: Some(tokens),
             })
@@ -330,13 +336,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learns_the_affinity_worker_from_the_sent_event() {
+    async fn selects_a_worker_then_reconciles_the_sent_event() {
         let mut classifier = classifier(&[(1, 300), (2, 1_000)]);
         register(&classifier, "request-1", "session-a", 250, false);
         release(&classifier, "request-1").await;
         assert_eq!(
             classifier.inner.state.lock().programs["session-a"].assigned_worker,
-            None
+            Some(WorkerWithDpRank::new(1, 0))
         );
         sent(&mut classifier, "request-1", 2).await;
         assert_eq!(
@@ -393,7 +399,7 @@ mod tests {
 
         classifier
             .on_event(ClassifyEvent::Aborted {
-                request_id: "request-3",
+                request_id: "request-3".to_owned(),
                 worker: Some(WorkerWithDpRank::new(1, 0)),
                 error: None,
             })
@@ -760,10 +766,10 @@ mod tests {
             let request_id = format!("request-{sequence}");
             let session_id = format!("session-{sequence}");
             register(&classifier, &request_id, &session_id, 1, true);
-            assert_eq!(
+            assert!(matches!(
                 classifier.inner.state.lock().wait_status(&request_id),
-                WaitStatus::Released
-            );
+                WaitStatus::Released(_)
+            ));
             completed(&mut classifier, &request_id, 1).await;
         }
 
@@ -795,7 +801,10 @@ mod tests {
         assert_eq!(
             (0..REQUESTS)
                 .filter(|sequence| {
-                    state.wait_status(&format!("request-{sequence}")) == WaitStatus::Released
+                    matches!(
+                        state.wait_status(&format!("request-{sequence}")),
+                        WaitStatus::Released(_)
+                    )
                 })
                 .count(),
             REQUESTS
@@ -810,7 +819,7 @@ mod tests {
         release(&classifier, "request-1").await;
         classifier
             .on_event(ClassifyEvent::Aborted {
-                request_id: "request-1",
+                request_id: "request-1".to_owned(),
                 worker: None,
                 error: None,
             })
@@ -858,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_forces_release_without_changing_placement() {
+    async fn timeout_forces_release_on_the_least_loaded_worker() {
         let config = ThunderAgentConfig {
             scheduler_interval_seconds: 0.005,
             resume_timeout_seconds: 0.02,
@@ -877,6 +886,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            classifier.inner.state.lock().wait_status("request-1"),
+            WaitStatus::Released(Some(WorkerWithDpRank::new(1, 0)))
+        );
     }
 
     #[tokio::test]

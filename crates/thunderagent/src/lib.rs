@@ -5,6 +5,7 @@ mod capacity;
 mod config;
 mod policy;
 mod scheduler;
+mod selection;
 
 pub use capacity::{WorkerCapacityProvider, WorkerCapacitySnapshot};
 pub use config::{ConfigError, ThunderAgentConfig};
@@ -17,8 +18,12 @@ use dynamo_kv_router::scheduling::{
     RequestClassifierProviderError, RequestClassifierRegistry, RequestClassifierRegistryError,
 };
 use dynamo_kv_router::services::selection::{
-    WorkerSelectionPolicyRegistry, WorkerSelectionPolicyRegistryError,
+    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
+    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
+    WorkerSelectionPolicyRegistryError,
 };
+use dynamo_kv_router::{WorkerSelectionPolicy, WorkerType};
+use selection::{ThunderAgentPicker, ThunderAgentScorer};
 
 pub const THUNDERAGENT_CLASSIFIER_TYPE: &str = "thunderagent";
 
@@ -56,11 +61,33 @@ fn classifier_provider(
     }))
 }
 
-/// Keep Dynamo's built-in worker selector, including its hard/soft session-affinity handling.
+fn worker_selection_provider(
+    parameters: &WorkerSelectionPolicyParameters,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    let config: ThunderAgentConfig = parameters.deserialize()?;
+    config
+        .validate()
+        .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
+    Ok(Arc::new(
+        move |router, worker_type: WorkerType, _partition| {
+            WorkerSelectionPolicy::new(
+                router.clone(),
+                worker_type.as_str(),
+                vec![Box::new(ThunderAgentScorer)],
+                Box::new(ThunderAgentPicker),
+            )
+        },
+    ))
+}
+
+/// Register ThunderAgent's stateless worker-target selector.
 pub fn register(
-    _registry: &mut WorkerSelectionPolicyRegistry,
+    registry: &mut WorkerSelectionPolicyRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    Ok(())
+    registry.register(
+        THUNDERAGENT_CLASSIFIER_TYPE,
+        Arc::new(worker_selection_provider),
+    )
 }
 
 /// Register ThunderAgent as a statically linked request-classifier plugin.
@@ -78,10 +105,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_only_a_request_classifier() {
+    fn registers_classifier_and_worker_selector() {
         let mut worker_registry = WorkerSelectionPolicyRegistry::default();
         register(&mut worker_registry).unwrap();
-        assert!(worker_registry.is_empty());
+        assert!(!worker_registry.is_empty());
 
         let mut classifier_registry = RequestClassifierRegistry::default();
         register_request_classifiers(&mut classifier_registry).unwrap();
