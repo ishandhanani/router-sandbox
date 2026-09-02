@@ -45,6 +45,23 @@ flowchart TD
     M --> F
 ```
 
+## Score and pick
+
+Worker selection is a stateless execution step for the classifier's placement decision. It does not read or mutate the classifier's program table, decide when to pause or resume, or own session pinning.
+
+The scorer requires Dynamo's worker `LOAD` input and assigns each eligible candidate this lower-is-better cost:
+
+```text
+active_prefill_tokens + (decode_cost_blocks * kv_cache_block_size)
+```
+
+The picker then applies two rules in order:
+
+1. If the request carries a classifier or session-affinity target and that worker/rank remains eligible, select it regardless of its load score. This is how the classifier's best-fit-decreasing placement is executed.
+2. Otherwise, select the eligible candidate with the lowest score, breaking ties by worker identity for deterministic behavior. This handles a removed, unhealthy, or otherwise ineligible target without failing the request.
+
+The target is advisory, not a reservation. Dynamo applies routing constraints and worker eligibility before the picker runs. After dispatch, the `Sent` classifier event reports the worker/rank actually selected so the classifier can reconcile its assignment and capacity accounting. Soft session affinity preserves normal cross-turn locality but permits the classifier to clear or replace the request-local target when it pauses and repacks a program.
+
 The catalog factory receives a cached view of Dynamo's existing discovery state. It derives each worker/rank's program-retention budget as `kv_cache_block_size * total_kv_blocks`, while representing worker liveness separately from missing capacity metadata. The callback only reads the cached view; it performs no discovery, model-card parsing, or blocking I/O on the classification path.
 
 ThunderAgent computes live used capacity from its own program table. On each reconciliation, it accounts for active program tokens plus `buffer_per_program`. Acting programs use `acting_token_weight`. When a worker exceeds `pause_threshold`, the classifier pauses smaller acting programs first until usage reaches `pause_target`; in-flight reasoning programs are marked to pause after completion. Pausing clears the program assignment. Normal resume selects a fairness-ordered prefix against aggregate capacity, then uses largest-first best-fit-decreasing packing across workers. A request that waits longer than `resume_timeout_seconds` is assigned to the worker with the most capacity after decayed acting-token usage and force-released.
