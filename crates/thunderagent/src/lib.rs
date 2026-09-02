@@ -2,70 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod config;
-mod policy;
-mod selection;
+mod request_classifier;
+mod worker_selection;
 
 pub use config::{ConfigError, ThunderAgentConfig};
-
-use std::sync::Arc;
-
-use dynamo_kv_router::services::selection::{
-    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
-    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
-    WorkerSelectionPolicyRegistryError,
+pub use request_classifier::{
+    ThunderAgentClassifier, WorkerCapacityProvider, WorkerCapacitySnapshot,
 };
-use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy};
 
-use selection::SessionAssignments;
-use selection::{ThunderAgentPicker, ThunderAgentScorer};
+use dynamo_kv_router::scheduling::{RequestClassifierRegistry, RequestClassifierRegistryError};
+use dynamo_kv_router::services::selection::{
+    WorkerSelectionPolicyRegistry, WorkerSelectionPolicyRegistryError,
+};
 
-use policy::ThunderAgentPolicy;
+pub const THUNDERAGENT_CLASSIFIER_TYPE: &str = "thunderagent";
 
-/// Build one complete ThunderAgent policy for a Dynamo routing partition.
-pub fn worker_selection_policy(
-    kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
-    config: ThunderAgentConfig,
-) -> Result<WorkerSelectionPolicy, ConfigError> {
-    config.validate()?;
-    Ok(validated_policy(kv_router_config, worker_type, config))
-}
-
-fn validated_policy(
-    kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
-    config: ThunderAgentConfig,
-) -> WorkerSelectionPolicy {
-    let assignments = Arc::new(SessionAssignments::default());
-    let admission = ThunderAgentPolicy::new(config, Arc::clone(&assignments));
-    let scorer = ThunderAgentScorer;
-    let picker = ThunderAgentPicker::new(assignments);
-    WorkerSelectionPolicy::new(
-        kv_router_config,
-        worker_type,
-        vec![Box::new(scorer)],
-        Box::new(picker),
-    )
-    .with_admission_policy(Box::new(admission))
-}
-
-fn provider(
-    parameters: &WorkerSelectionPolicyParameters,
-) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    let config: ThunderAgentConfig = parameters.deserialize()?;
-    config
-        .validate()
-        .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
-    Ok(Arc::new(move |router, worker_type, _partition| {
-        validated_policy(router.clone(), worker_type, config.clone())
-    }))
-}
-
-/// Register ThunderAgent under the `thunderagent` worker-selection policy type.
+/// Register ThunderAgent's stateless worker-target selector.
 pub fn register(
     registry: &mut WorkerSelectionPolicyRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    registry.register("thunderagent", Arc::new(provider))
+    worker_selection::register(registry)
+}
+
+/// Register ThunderAgent as a statically linked request-classifier plugin.
+pub fn register_request_classifiers(
+    registry: &mut RequestClassifierRegistry,
+) -> Result<(), RequestClassifierRegistryError> {
+    request_classifier::register(registry)
 }
 
 #[cfg(test)]
@@ -73,12 +36,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_once() {
-        let mut registry = WorkerSelectionPolicyRegistry::default();
-        register(&mut registry).unwrap();
-        assert!(matches!(
-            register(&mut registry),
-            Err(WorkerSelectionPolicyRegistryError::Duplicate { name }) if name == "thunderagent"
-        ));
+    fn registers_classifier_and_worker_selector() {
+        let mut worker_registry = WorkerSelectionPolicyRegistry::default();
+        register(&mut worker_registry).unwrap();
+        assert!(!worker_registry.is_empty());
+
+        let mut classifier_registry = RequestClassifierRegistry::default();
+        register_request_classifiers(&mut classifier_registry).unwrap();
+        assert!(!classifier_registry.is_empty());
     }
 }

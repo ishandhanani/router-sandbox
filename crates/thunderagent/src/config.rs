@@ -24,6 +24,7 @@ pub struct ThunderAgentConfig {
     pub acting_token_weight: f64,
     pub acting_decay_tau_seconds: f64,
     pub buffer_per_program: usize,
+    pub max_tracked_requests: usize,
 }
 
 impl Default for ThunderAgentConfig {
@@ -38,6 +39,7 @@ impl Default for ThunderAgentConfig {
             acting_token_weight: 1.0,
             acting_decay_tau_seconds: 1.0,
             buffer_per_program: 100,
+            max_tracked_requests: 10_000,
         }
     }
 }
@@ -82,7 +84,24 @@ impl ThunderAgentConfig {
                 "acting_decay_tau_seconds must be finite and positive",
             ));
         }
+        if self.max_tracked_requests == 0 {
+            return Err(ConfigError::Invalid(
+                "max_tracked_requests must be positive",
+            ));
+        }
         Ok(())
+    }
+
+    pub(crate) fn resume_timeout(&self) -> Duration {
+        Duration::from_secs_f64(self.resume_timeout_seconds)
+    }
+
+    pub(crate) fn session_retention(&self) -> Duration {
+        Duration::from_secs_f64(self.session_retention_seconds)
+    }
+
+    pub(crate) fn scheduler_interval(&self) -> Duration {
+        Duration::from_secs_f64(self.scheduler_interval_seconds)
     }
 }
 

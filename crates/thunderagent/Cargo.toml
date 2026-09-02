@@ -1,24 +1,19 @@
 [package]
 name = "thunderagent-dynamo-policy"
-description = "ThunderAgent session-aware admission and routing policy for Dynamo"
+description = "ThunderAgent program-aware request classifier for Dynamo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["standalone-selection"] }
+async-trait = "0.1"
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "625a1c98564608b45550ff0903e12ea06768849e", features = ["standalone-selection"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
-criterion = "0.5"
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "idhanani/dyn-3231-session-aware-policy-crate", features = ["bench", "standalone-selection"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
-tokio-util = "0.7"
-
-[[bench]]
-name = "admission_overhead"
-harness = false
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

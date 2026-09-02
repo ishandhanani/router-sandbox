@@ -1,69 +1,110 @@
 # ThunderAgent
 
-`thunderagent-dynamo-policy` is a session-aware Dynamo routing policy. It owns the ThunderAgent admission and capacity state outside Dynamo while Dynamo continues to own request storage and serially invokes the policy from its queue actor.
+`thunderagent-dynamo-policy` implements ThunderAgent's program-aware flow control on Dynamo's asynchronous request-classifier API. It registers a request classifier and a worker-selection policy through Dynamo's statically linked router-plugin catalog; no Python adapter is required.
 
-Runnable ordering remains Dynamo-owned. This prototype depends on the Dynamo queue-admission seam in [ai-dynamo/dynamo#13019](https://github.com/ai-dynamo/dynamo/pull/13019).
+This prototype is stacked on [ai-dynamo/dynamo#14123](https://github.com/ai-dynamo/dynamo/pull/14123) and its request-classifier catalog follow-up.
 
-## Algorithm
+## Source layout
 
-The returned `WorkerSelectionPolicy` combines three components:
+```text
+src/
+├── lib.rs                       # Public exports and catalog registration façade
+├── config.rs                    # ThunderAgent configuration and validation
+├── request_classifier/
+│   ├── mod.rs                   # RequestClassifier implementation and plugin factory
+│   ├── capacity.rs              # Cached worker capacity and liveness view
+│   └── scheduler.rs             # Program state, admission, pause, resume, and repacking
+└── worker_selection/
+    └── mod.rs                   # Stateless load scorer, target-aware picker, and plugin factory
+```
 
-1. The queue-admission policy serializes each session: a session has at most one runnable request, and subsequent requests wait in session order.
-2. For a session without an existing assignment, admission selects an eligible available worker with enough reported token capacity. It chooses the least-used worker that can fit the request context plus `buffer_per_program`.
-3. The picker preserves that session's assigned worker when it remains eligible; otherwise it falls back to the minimum Dynamo load score, breaking ties by stable worker key.
+## Ownership and routing
 
-Requests without Dynamo session context bypass the session admission logic and use the fallback scorer and picker directly.
+`ThunderAgentClassifier` owns the complete program table: per-session serialization, reasoning/acting state, pause state, retained token usage, and worker assignment. The state is internally reference-counted because `classify` must return independently pollable `'static` futures, but it is not shared with the worker selector.
+
+The classifier chooses a request-local worker target when it releases a request. ThunderAgent's stateless selector honors that target when it is eligible and otherwise falls back to current least-loaded placement. The `Sent` lifecycle event reconciles the program table with the worker Dynamo actually selected. If a worker disappears, the classifier clears the assignment and chooses a live replacement.
+
+Use soft session affinity. Affinity preserves locality between requests, while soft mode allows the classifier to repack a paused program onto a different worker. Hard affinity would prevent that Python-parity behavior before the custom selector runs.
+
+Requests without Dynamo session context return from classification immediately.
 
 ```mermaid
 flowchart TD
-    A["Request arrives"] --> B{"Has session context?"}
-    B -- "No" --> C["Route by fallback load score"]
-    B -- "Yes" --> D{"Another request is active for the session?"}
-    D -- "Yes" --> E["Defer in session FIFO queue"]
-    D -- "No" --> F{"Existing eligible assignment?"}
-    F -- "Yes" --> G["Mark request runnable"]
-    F -- "No" --> H["Select least-used worker with enough capacity"]
-    H --> I{"Capacity available?"}
-    I -- "Yes" --> G
-    I -- "No" --> J["Pause and defer session"]
-    E --> K["Periodic capacity reconciliation"]
-    J --> K
-    K --> L["Resume eligible sessions or force after timeout"]
+    A["Request enters classify"] --> B{"Has session context?"}
+    B -- "No" --> C["Return unchanged"]
+    B -- "Yes" --> D["Register in classifier-owned program table"]
+    D --> E{"Session busy or program paused?"}
+    E -- "Yes" --> F["Keep the classify future pending"]
+    E -- "No" --> G{"Known pressure permits release?"}
+    G -- "No" --> F
+    G -- "Yes" --> H["Attach chosen worker target and return request"]
+    H --> I["Stateless selector honors target or falls back"]
+    I --> J["Sent reconciles the actual worker"]
+    K["Completed or Aborted"] --> L["Commit or roll back program state"]
+    L --> M["Notify pending classifier futures"]
+    M --> F
 ```
 
-On each reconciliation interval, the policy accounts for active program tokens plus the configured per-program buffer. Acting programs use a configurable token weight and a decayed estimate for forced timeout resumption. When a worker exceeds `pause_threshold`, the policy pauses smaller acting programs first until usage reaches `pause_target`; reasoning programs are marked to pause after their current request completes. It resumes paused sessions greedily below `pause_threshold - resume_hysteresis`, preserving an existing assignment when possible. A paused session is force-resumed after `resume_timeout_seconds` when an eligible worker is available.
+## Score and pick
 
-Completed sessions transition to an acting state and retain their assignment for `session_retention_seconds`; inactive retained sessions are later expired. Worker removal clears affected assignments.
+Worker selection is a stateless execution step for the classifier's placement decision. It does not read or mutate the classifier's program table, decide when to pause or resume, or own session pinning.
+
+The scorer requires Dynamo's worker `LOAD` input and assigns each eligible candidate this lower-is-better cost:
+
+```text
+active_prefill_tokens + (decode_cost_blocks * kv_cache_block_size)
+```
+
+The picker then applies two rules in order:
+
+1. If the request carries a classifier or session-affinity target and that worker/rank remains eligible, select it regardless of its load score. This is how the classifier's best-fit-decreasing placement is executed.
+2. Otherwise, select the eligible candidate with the lowest score, breaking ties by worker identity for deterministic behavior. This handles a removed, unhealthy, or otherwise ineligible target without failing the request.
+
+The target is advisory, not a reservation. Dynamo applies routing constraints and worker eligibility before the picker runs. After dispatch, the `Sent` classifier event reports the worker/rank actually selected so the classifier can reconcile its assignment and capacity accounting. Soft session affinity preserves normal cross-turn locality but permits the classifier to clear or replace the request-local target when it pauses and repacks a program.
+
+The catalog factory receives a cached view of Dynamo's existing discovery state. It derives each worker/rank's program-retention budget as `kv_cache_block_size * total_kv_blocks`, while representing worker liveness separately from missing capacity metadata. The callback only reads the cached view; it performs no discovery, model-card parsing, or blocking I/O on the classification path.
+
+ThunderAgent computes live used capacity from its own program table. On each reconciliation, it accounts for active program tokens plus `buffer_per_program`. Acting programs use `acting_token_weight`. When a worker exceeds `pause_threshold`, the classifier pauses smaller acting programs first until usage reaches `pause_target`; in-flight reasoning programs are marked to pause after completion. Pausing clears the program assignment. Normal resume selects a fairness-ordered prefix against aggregate capacity, then uses largest-first best-fit-decreasing packing across workers. A request that waits longer than `resume_timeout_seconds` is assigned to the worker with the most capacity after decayed acting-token usage and force-released.
+
+The request target is advisory rather than a reservation. Caller constraints and worker liveness remain authoritative, and `Sent` corrects the classifier's accounting if selection falls back.
+
+Completion records Dynamo's terminal input-plus-output context size. The current classifier lifecycle does not expose cumulative streaming context progress, so this crate updates program size only at completion. A final session removes its program when the final request is admitted; completion or abort cannot restore it. A continuing idle program retains its observed assignment for `session_retention_seconds`. Idle retention is pruned lazily on the next classification or periodic reconciliation. The tracking limit also bounds retained programs; at the limit, the oldest idle retained program is evicted before admitting a new session.
 
 ## Configuration
 
-The policy registers the type `thunderagent`. Its YAML parameters are the fields of `ThunderAgentConfig`; [`worker-selection.yaml`](worker-selection.yaml) supplies the defaults.
+Link this crate in place of Dynamo's default router-plugin catalog, enable soft Dynamo session affinity, and select ThunderAgent for both classification and aggregated worker selection:
+
+```yaml
+request_classifier:
+  type: thunderagent
+  parameters:
+    pause_threshold: 0.95
+    pause_target: 0.80
+    resume_hysteresis: 0.10
+    resume_timeout_seconds: 1800
+    session_retention_seconds: 1800
+    scheduler_interval_seconds: 5
+    acting_token_weight: 1
+    acting_decay_tau_seconds: 1
+    buffer_per_program: 100
+    max_tracked_requests: 10000
+worker_selection:
+  aggregated: thunderagent
+  instances:
+    - name: thunderagent
+      type: thunderagent
+      parameters: {}
+```
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `pause_threshold` | `0.95` | Usage fraction that begins pausing programs |
-| `pause_target` | `0.80` | Usage fraction to recover to after pausing |
-| `resume_hysteresis` | `0.10` | Additional headroom required before greedy resume |
-| `resume_timeout_seconds` | `1800` | Maximum deferred duration before forced resume |
-| `session_retention_seconds` | `1800` | Retention period for completed acting sessions |
-| `scheduler_interval_seconds` | `5` | Capacity reconciliation cadence |
-| `acting_token_weight` | `1` | Normal capacity weight for an acting program |
-| `acting_decay_tau_seconds` | `1` | Half-life control for the decayed acting estimate |
-| `buffer_per_program` | `100` | Reserved tokens per active program |
-
-## Integrate as a policy catalog
-
-Link the crate directly as Dynamo's `dynamo-worker-selection-policy-catalog` dependency, or call [`register`](src/lib.rs) from a combined catalog. The policy factory can also be constructed programmatically:
-
-```rust
-use std::sync::Arc;
-
-use dynamo_kv_router::WorkerSelectionPolicyFactory;
-use thunderagent_dynamo_policy::{ThunderAgentConfig, worker_selection_policy};
-
-let config = ThunderAgentConfig::default();
-let factory: WorkerSelectionPolicyFactory = Arc::new(move |router, worker_type, _partition| {
-    worker_selection_policy(router.clone(), worker_type, config.clone())
-        .expect("valid ThunderAgent configuration")
-});
-```
+| `pause_threshold` | `0.95` | Worker usage fraction that begins pausing programs |
+| `pause_target` | `0.80` | Worker usage fraction that a pause cycle drains toward |
+| `resume_hysteresis` | `0.10` | Headroom below the pause threshold required for normal resume |
+| `resume_timeout_seconds` | `1800` | Maximum classifier deferral before forced release |
+| `session_retention_seconds` | `1800` | Idle continuing-program retention period |
+| `scheduler_interval_seconds` | `5` | Fixed cadence for pressure and resume decisions while programs are tracked |
+| `acting_token_weight` | `1` | Capacity weight for a program during tool work |
+| `acting_decay_tau_seconds` | `1` | Half-life in seconds for acting-token usage during timeout fallback placement |
+| `buffer_per_program` | `100` | Fixed token headroom per active program |
+| `max_tracked_requests` | `10000` | Independent bounds for active request state and retained program state before classification reaches Dynamo's queue |
