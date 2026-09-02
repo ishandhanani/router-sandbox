@@ -4,6 +4,20 @@
 
 This prototype is stacked on [ai-dynamo/dynamo#14123](https://github.com/ai-dynamo/dynamo/pull/14123) and its request-classifier catalog follow-up.
 
+## Source layout
+
+```text
+src/
+├── lib.rs                       # Public exports and catalog registration façade
+├── config.rs                    # ThunderAgent configuration and validation
+├── request_classifier/
+│   ├── mod.rs                   # RequestClassifier implementation and plugin factory
+│   ├── capacity.rs              # Cached worker capacity and liveness view
+│   └── scheduler.rs             # Program state, admission, pause, resume, and repacking
+└── worker_selection/
+    └── mod.rs                   # Stateless load scorer, target-aware picker, and plugin factory
+```
+
 ## Ownership and routing
 
 `ThunderAgentClassifier` owns the complete program table: per-session serialization, reasoning/acting state, pause state, retained token usage, and worker assignment. The state is internally reference-counted because `classify` must return independently pollable `'static` futures, but it is not shared with the worker selector.

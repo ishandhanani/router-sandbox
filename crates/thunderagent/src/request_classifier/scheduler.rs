@@ -10,9 +10,9 @@ use dynamo_kv_router::protocols::WorkerWithDpRank;
 use dynamo_kv_router::scheduling::{ClassifyEvent, RequestProgress};
 use tokio::sync::Notify;
 
+use super::ThunderAgentError;
+use super::capacity::WorkerCapacitySnapshot;
 use crate::ThunderAgentConfig;
-use crate::capacity::WorkerCapacitySnapshot;
-use crate::policy::ThunderAgentError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProgramStatus {

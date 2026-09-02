@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod capacity;
+mod scheduler;
+
+pub use capacity::{WorkerCapacityProvider, WorkerCapacitySnapshot};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -8,15 +13,59 @@ use std::time::Instant;
 use async_trait::async_trait;
 use dynamo_kv_router::scheduling::{
     ClassifierError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
+    RequestClassifierContext, RequestClassifierFactory, RequestClassifierParameters,
+    RequestClassifierProviderError, RequestClassifierRegistry, RequestClassifierRegistryError,
     RequestProgress,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::Notify;
 
-use crate::capacity::WorkerCapacityProvider;
-use crate::scheduler::{RequestRegistration, State, WaitStatus};
+use self::scheduler::{RequestRegistration, State, WaitStatus};
 use crate::{ConfigError, ThunderAgentConfig};
+
+fn capacity_provider(context: RequestClassifierContext) -> Arc<dyn WorkerCapacityProvider> {
+    let block_size = u64::from(context.block_size());
+    Arc::new(move || {
+        let workers = context.workers();
+        let live_workers = workers.iter().map(|worker| worker.worker());
+        let capacities = workers.iter().filter_map(|worker| {
+            let total_kv_blocks = worker.total_kv_blocks()?;
+            let capacity = total_kv_blocks.saturating_mul(block_size);
+            Some((
+                worker.worker(),
+                usize::try_from(capacity).unwrap_or(usize::MAX),
+            ))
+        });
+        Arc::new(WorkerCapacitySnapshot::new(capacities).with_live_workers(live_workers))
+    })
+}
+
+fn classifier_provider(
+    parameters: &RequestClassifierParameters,
+) -> Result<RequestClassifierFactory, RequestClassifierProviderError> {
+    let config: ThunderAgentConfig = parameters.deserialize()?;
+    config
+        .validate()
+        .map_err(|error| RequestClassifierProviderError::new(error.to_string()))?;
+
+    Ok(Arc::new(move |context| {
+        let capacity_provider = capacity_provider(context);
+        Box::new(
+            ThunderAgentClassifier::new(config.clone(), capacity_provider)
+                .expect("ThunderAgent configuration was validated during catalog resolution"),
+        )
+    }))
+}
+
+pub(crate) fn register(
+    registry: &mut RequestClassifierRegistry,
+) -> Result<(), RequestClassifierRegistryError> {
+    registry.register(
+        crate::THUNDERAGENT_CLASSIFIER_TYPE,
+        Arc::new(classifier_provider),
+    )
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum ThunderAgentError {
@@ -255,10 +304,30 @@ mod tests {
     use std::time::Duration;
 
     use dynamo_kv_router::protocols::WorkerWithDpRank;
+    use dynamo_kv_router::scheduling::RequestClassifierWorker;
 
+    use super::scheduler::ProgramLifecycle;
     use super::*;
-    use crate::capacity::WorkerCapacitySnapshot;
-    use crate::scheduler::ProgramLifecycle;
+
+    #[test]
+    fn derives_capacity_and_liveness_from_the_host_context() {
+        let worker_with_capacity = WorkerWithDpRank::new(1, 0);
+        let worker_without_capacity = WorkerWithDpRank::new(2, 0);
+        let context = RequestClassifierContext::new(16, move || {
+            vec![
+                RequestClassifierWorker::new(worker_with_capacity, Some(10)),
+                RequestClassifierWorker::new(worker_without_capacity, None),
+            ]
+        });
+
+        let snapshot = capacity_provider(context).snapshot();
+        assert_eq!(
+            snapshot.iter().collect::<Vec<_>>(),
+            [(worker_with_capacity, 160)]
+        );
+        assert!(snapshot.is_live(worker_with_capacity));
+        assert!(snapshot.is_live(worker_without_capacity));
+    }
 
     fn config() -> ThunderAgentConfig {
         ThunderAgentConfig {

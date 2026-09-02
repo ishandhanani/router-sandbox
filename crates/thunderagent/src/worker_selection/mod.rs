@@ -1,12 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
+use dynamo_kv_router::services::selection::{
+    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
+    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
+    WorkerSelectionPolicyRegistryError,
+};
 use dynamo_kv_router::{
     WorkerCandidate, WorkerInputView, WorkerInputs, WorkerPicker, WorkerScorer,
-    WorkerSelectionContext, WorkerSelectionPolicyError,
+    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerType,
 };
 
-pub(crate) struct ThunderAgentScorer;
+use crate::{THUNDERAGENT_CLASSIFIER_TYPE, ThunderAgentConfig};
+
+struct ThunderAgentScorer;
 
 impl WorkerScorer for ThunderAgentScorer {
     fn required_worker_inputs(&self) -> WorkerInputs {
@@ -26,7 +35,7 @@ impl WorkerScorer for ThunderAgentScorer {
     }
 }
 
-pub(crate) struct ThunderAgentPicker;
+struct ThunderAgentPicker;
 
 impl WorkerPicker for ThunderAgentPicker {
     fn pick(
@@ -57,6 +66,34 @@ impl WorkerPicker for ThunderAgentPicker {
             .map(|(row, _)| row)
             .ok_or_else(|| WorkerSelectionPolicyError::failed("no eligible worker"))
     }
+}
+
+fn worker_selection_provider(
+    parameters: &WorkerSelectionPolicyParameters,
+) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
+    let config: ThunderAgentConfig = parameters.deserialize()?;
+    config
+        .validate()
+        .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
+    Ok(Arc::new(
+        move |router, worker_type: WorkerType, _partition| {
+            WorkerSelectionPolicy::new(
+                router.clone(),
+                worker_type.as_str(),
+                vec![Box::new(ThunderAgentScorer)],
+                Box::new(ThunderAgentPicker),
+            )
+        },
+    ))
+}
+
+pub(crate) fn register(
+    registry: &mut WorkerSelectionPolicyRegistry,
+) -> Result<(), WorkerSelectionPolicyRegistryError> {
+    registry.register(
+        THUNDERAGENT_CLASSIFIER_TYPE,
+        Arc::new(worker_selection_provider),
+    )
 }
 
 #[cfg(test)]
