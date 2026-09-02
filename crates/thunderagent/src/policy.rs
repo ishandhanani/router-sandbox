@@ -8,13 +8,14 @@ use std::time::Instant;
 use async_trait::async_trait;
 use dynamo_kv_router::scheduling::{
     ClassifierError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
+    RequestProgress,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::Notify;
 
 use crate::capacity::WorkerCapacityProvider;
-use crate::scheduler::{State, WaitStatus};
+use crate::scheduler::{RequestRegistration, State, WaitStatus};
 use crate::{ConfigError, ThunderAgentConfig};
 
 #[derive(Debug, Error)]
@@ -47,14 +48,18 @@ impl Inner {
         request_id: String,
         session_id: String,
         input_tokens: usize,
+        progress: RequestProgress,
         session_final: bool,
     ) -> Result<Arc<Notify>, ThunderAgentError> {
         let capacities = self.capacity_provider.snapshot();
         self.state.lock().register(
-            request_id,
-            session_id,
-            input_tokens,
-            session_final,
+            RequestRegistration::new(
+                request_id,
+                session_id,
+                input_tokens,
+                progress,
+                session_final,
+            ),
             &capacities,
             Instant::now(),
         )
@@ -211,16 +216,19 @@ impl RequestClassifier for ThunderAgentClassifier {
         let session_id = session.session_id().to_owned();
         let session_final = session.session_final() == Some(true);
         let input_tokens = request.input_tokens();
-        let notify =
-            match self
-                .inner
-                .register(request_id.clone(), session_id, input_tokens, session_final)
-            {
-                Ok(notify) => notify,
-                Err(error) => {
-                    return Box::pin(async move { Err(Box::new(error) as Box<ClassifierError>) });
-                }
-            };
+        let progress = request.progress().clone();
+        let notify = match self.inner.register(
+            request_id.clone(),
+            session_id,
+            input_tokens,
+            progress,
+            session_final,
+        ) {
+            Ok(notify) => notify,
+            Err(error) => {
+                return Box::pin(async move { Err(Box::new(error) as Box<ClassifierError>) });
+            }
+        };
 
         let inner = Arc::clone(&self.inner);
         let pending = PendingClassification::new(inner, request_id, notify);
@@ -281,12 +289,14 @@ mod tests {
         tokens: usize,
         session_final: bool,
     ) {
+        let (progress, _) = RequestProgress::new(tokens);
         classifier
             .inner
             .register(
                 request_id.to_owned(),
                 session_id.to_owned(),
                 tokens,
+                progress,
                 session_final,
             )
             .unwrap();
@@ -734,9 +744,13 @@ mod tests {
         .unwrap();
         register(&classifier, "request-1", "session-a", 100, false);
 
-        let result = classifier
-            .inner
-            .register("request-2".into(), "session-b".into(), 100, false);
+        let result = classifier.inner.register(
+            "request-2".into(),
+            "session-b".into(),
+            100,
+            RequestProgress::new(100).0,
+            false,
+        );
         assert!(matches!(
             result,
             Err(ThunderAgentError::RequestLimitExceeded { limit: 1 })

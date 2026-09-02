@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynamo_kv_router::protocols::WorkerWithDpRank;
-use dynamo_kv_router::scheduling::ClassifyEvent;
+use dynamo_kv_router::scheduling::{ClassifyEvent, RequestProgress};
 use tokio::sync::Notify;
 
 use crate::ThunderAgentConfig;
@@ -32,6 +32,7 @@ pub(crate) struct Program {
     pub(crate) lifecycle: ProgramLifecycle,
     pub(crate) assigned_worker: Option<WorkerWithDpRank>,
     token_total: usize,
+    request_progress: Option<RequestProgress>,
     pub(crate) step_count: usize,
     marked_for_pause: bool,
     acting_since: Option<Instant>,
@@ -45,6 +46,7 @@ impl Program {
             lifecycle: ProgramLifecycle::Active,
             assigned_worker: None,
             token_total: input_tokens,
+            request_progress: None,
             step_count: 1,
             marked_for_pause: false,
             acting_since: None,
@@ -62,12 +64,39 @@ enum RequestPhase {
 pub(crate) struct RequestState {
     session_id: String,
     input_tokens: usize,
+    progress: RequestProgress,
     session_final: bool,
     phase: RequestPhase,
     prior_program: Option<Program>,
     began_program: bool,
     placement_target: Option<WorkerWithDpRank>,
     pub(crate) notify: Arc<Notify>,
+}
+
+pub(crate) struct RequestRegistration {
+    request_id: String,
+    session_id: String,
+    input_tokens: usize,
+    progress: RequestProgress,
+    session_final: bool,
+}
+
+impl RequestRegistration {
+    pub(crate) fn new(
+        request_id: String,
+        session_id: String,
+        input_tokens: usize,
+        progress: RequestProgress,
+        session_final: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            session_id,
+            input_tokens,
+            progress,
+            session_final,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -143,13 +172,17 @@ impl State {
 
     pub(crate) fn register(
         &mut self,
-        request_id: String,
-        session_id: String,
-        input_tokens: usize,
-        session_final: bool,
+        request: RequestRegistration,
         capacities: &WorkerCapacitySnapshot,
         now: Instant,
     ) -> Result<Arc<Notify>, ThunderAgentError> {
+        let RequestRegistration {
+            request_id,
+            session_id,
+            input_tokens,
+            progress,
+            session_final,
+        } = request;
         if self.requests.contains_key(&request_id) {
             return Err(ThunderAgentError::DuplicateRequestId(request_id));
         }
@@ -158,6 +191,7 @@ impl State {
                 limit: self.config.max_tracked_requests,
             });
         }
+        self.refresh_normal_usage();
         self.expire_retained_programs(now);
         if !session_final {
             self.ensure_program_capacity(&session_id)?;
@@ -177,6 +211,7 @@ impl State {
             RequestState {
                 session_id,
                 input_tokens,
+                progress,
                 session_final,
                 phase: RequestPhase::Waiting,
                 prior_program: None,
@@ -247,9 +282,12 @@ impl State {
         }
         let worker = program.assigned_worker?;
         let tokens = if program.status == ProgramStatus::Acting {
-            scale_tokens(program.token_total, self.config.acting_token_weight)
+            scale_tokens(
+                current_token_total(program),
+                self.config.acting_token_weight,
+            )
         } else {
-            program.token_total
+            current_token_total(program)
         };
         Some((
             worker,
@@ -275,6 +313,17 @@ impl State {
             let used = self.normal_usage.entry(worker).or_default();
             *used = used.saturating_add(tokens);
         }
+    }
+
+    fn refresh_normal_usage(&mut self) {
+        let mut normal_usage = HashMap::<WorkerWithDpRank, usize>::new();
+        for program in self.programs.values() {
+            if let Some((worker, tokens)) = self.program_charge(program) {
+                let used = normal_usage.entry(worker).or_default();
+                *used = used.saturating_add(tokens);
+            }
+        }
+        self.normal_usage = normal_usage;
     }
 
     fn update_program<R>(
@@ -328,6 +377,7 @@ impl State {
     }
 
     pub(crate) fn reconcile(&mut self, capacities: &WorkerCapacitySnapshot, now: Instant) -> bool {
+        self.refresh_normal_usage();
         let mut changed = self.expire_retained_programs(now);
         changed |= self.clear_removed_workers(capacities);
         changed |= self.admit_front_requests(capacities, now);
@@ -472,6 +522,7 @@ impl State {
         }
         let session_id = request.session_id.clone();
         let input_tokens = request.input_tokens;
+        let progress = request.progress.clone();
         let prior_program = self.programs.get(&session_id).cloned();
 
         if self.programs.contains_key(&session_id) {
@@ -480,11 +531,14 @@ impl State {
                 if input_tokens > 0 {
                     program.token_total = input_tokens;
                 }
+                program.request_progress = Some(progress);
                 program.step_count = program.step_count.saturating_add(1);
                 program.acting_since = None;
             });
         } else {
-            self.insert_program(session_id, Program::new(input_tokens));
+            let mut program = Program::new(input_tokens);
+            program.request_progress = Some(progress);
+            self.insert_program(session_id, program);
         }
         if let Some(request) = self.requests.get_mut(request_id) {
             request.prior_program = prior_program;
@@ -600,9 +654,8 @@ impl State {
             self.resume_group(left)
                 .cmp(&self.resume_group(right))
                 .then_with(|| {
-                    self.programs[left]
-                        .token_total
-                        .cmp(&self.programs[right].token_total)
+                    current_token_total(&self.programs[left])
+                        .cmp(&current_token_total(&self.programs[right]))
                 })
                 .then_with(|| left.cmp(right))
         });
@@ -624,9 +677,8 @@ impl State {
             .collect::<Vec<_>>();
 
         selected.sort_unstable_by(|(left, _), (right, _)| {
-            self.programs[right]
-                .token_total
-                .cmp(&self.programs[left].token_total)
+            current_token_total(&self.programs[right])
+                .cmp(&current_token_total(&self.programs[left]))
                 .then_with(|| left.cmp(right))
         });
         let mut packed_capacity = original_remaining;
@@ -681,8 +733,7 @@ impl State {
     }
 
     fn buffered_program_tokens(&self, session_id: &str) -> usize {
-        self.programs[session_id]
-            .token_total
+        current_token_total(&self.programs[session_id])
             .saturating_add(self.config.buffer_per_program)
     }
 
@@ -847,7 +898,7 @@ impl State {
                     && program.assigned_worker == Some(worker)
                     && !program.marked_for_pause
             })
-            .map(|(session_id, program)| (program.token_total, session_id.clone()))
+            .map(|(session_id, program)| (current_token_total(program), session_id.clone()))
             .collect()
     }
 
@@ -857,6 +908,7 @@ impl State {
         capacities: &WorkerCapacitySnapshot,
         now: Instant,
     ) -> bool {
+        self.refresh_normal_usage();
         match event {
             ClassifyEvent::Sent { request_id, worker } => self.sent(&request_id, worker),
             ClassifyEvent::Completed {
@@ -890,6 +942,7 @@ impl State {
         capacities: &WorkerCapacitySnapshot,
         now: Instant,
     ) -> bool {
+        self.refresh_normal_usage();
         self.finish_request(request_id, false, None, capacities, now)
     }
 
@@ -922,7 +975,9 @@ impl State {
             let pause = self
                 .update_program(&request.session_id, |program| {
                     program.status = ProgramStatus::Acting;
-                    program.token_total = context_tokens.unwrap_or(request.input_tokens);
+                    program.token_total =
+                        context_tokens.unwrap_or_else(|| request.progress.context_tokens());
+                    program.request_progress = None;
                     program.acting_since = Some(now);
                     program.deferred_since = None;
                     std::mem::take(&mut program.marked_for_pause)
@@ -1095,8 +1150,9 @@ impl State {
     }
 
     fn program_tokens(&self, program: &Program, decayed: bool, now: Instant) -> usize {
+        let token_total = current_token_total(program);
         if program.status != ProgramStatus::Acting {
-            return program.token_total;
+            return token_total;
         }
         let weight = if decayed {
             let idle = program
@@ -1106,7 +1162,7 @@ impl State {
         } else {
             self.config.acting_token_weight
         };
-        scale_tokens(program.token_total, weight)
+        scale_tokens(token_total, weight)
     }
 
     fn request_cost(&self, input_tokens: usize) -> usize {
@@ -1142,6 +1198,13 @@ impl State {
 
 fn scale_tokens(tokens: usize, factor: f64) -> usize {
     ((tokens as f64) * factor).clamp(0.0, usize::MAX as f64) as usize
+}
+
+fn current_token_total(program: &Program) -> usize {
+    program
+        .request_progress
+        .as_ref()
+        .map_or(program.token_total, RequestProgress::context_tokens)
 }
 
 fn sort_capacities(capacities: &mut [(WorkerWithDpRank, usize)]) {
@@ -1187,6 +1250,7 @@ mod tests {
             lifecycle: ProgramLifecycle::Paused,
             assigned_worker: None,
             token_total: tokens,
+            request_progress: None,
             step_count: 2,
             marked_for_pause: false,
             acting_since: Some(now),
@@ -1244,10 +1308,13 @@ mod tests {
 
         state
             .register(
-                "request-1".to_owned(),
-                "session-a".to_owned(),
-                400,
-                false,
+                RequestRegistration::new(
+                    "request-1".to_owned(),
+                    "session-a".to_owned(),
+                    400,
+                    RequestProgress::new(400).0,
+                    false,
+                ),
                 &capacities,
                 now,
             )
@@ -1264,6 +1331,41 @@ mod tests {
         assert_eq!(state.programs["session-a"].assigned_worker, Some(worker));
 
         state.reconcile(&capacities, now + state.config.scheduler_interval());
+        assert!(state.programs["session-a"].marked_for_pause);
+    }
+
+    #[test]
+    fn streamed_progress_updates_capacity_pressure_without_a_state_event() {
+        let now = Instant::now();
+        let worker = WorkerWithDpRank::new(1, 0);
+        let mut state = state(ThunderAgentConfig {
+            pause_threshold: 0.50,
+            pause_target: 0.40,
+            buffer_per_program: 0,
+            ..Default::default()
+        });
+        let capacities = capacities(&[(1, 1_000)]);
+        let (progress, progress_updater) = RequestProgress::new(100);
+
+        state
+            .register(
+                RequestRegistration::new(
+                    "request-1".to_owned(),
+                    "session-a".to_owned(),
+                    100,
+                    progress,
+                    false,
+                ),
+                &capacities,
+                now,
+            )
+            .unwrap();
+        assert_eq!(state.worker_usage(now)[&worker].used, 100);
+
+        progress_updater.update_context_tokens(750);
+
+        state.reconcile(&capacities, now + state.config.scheduler_interval());
+        assert_eq!(state.worker_usage(now)[&worker].used, 750);
         assert!(state.programs["session-a"].marked_for_pause);
     }
 }

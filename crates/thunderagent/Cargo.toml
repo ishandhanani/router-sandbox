@@ -8,7 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "9a4baf3b7bdb02c2e4e27e7029b3910f7bf3f29f", features = ["standalone-selection"] }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "625a1c98564608b45550ff0903e12ea06768849e", features = ["standalone-selection"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
