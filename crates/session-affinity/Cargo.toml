@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "session-affinity-dynamo-policy"
+description = "Session-affinity worker-selection policy with a load gate for Dynamo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "main", features = ["standalone-selection"] }
+lru = "0.12"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"

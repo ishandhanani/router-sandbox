@@ -8,3 +8,4 @@ This Cargo workspace contains external routing strategies for Dynamo.
 - [`sticky-until-saturated-dynamo-policy`](crates/sticky-until-saturated/README.md) provides token-aware cache-affinity routing.
 - [`sglang-cache-aware-dynamo-policy`](crates/sglang-cache-aware/README.md) ports SGLang's cache-aware load gate using Dynamo's authoritative device-KV overlap.
 - [`sgl-router-cache-aware-dynamo-policy`](crates/sgl-router-cache-aware/README.md) ports the experimental SGL Router cache-aware policy used in the router comparison.
+- [`session-affinity-dynamo-policy`](crates/session-affinity/README.md) keeps agent sessions on their previous worker behind a request-count load gate.
