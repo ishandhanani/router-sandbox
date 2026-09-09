@@ -1,0 +1,13 @@
+worker_selection:
+  aggregated: session-affinity
+  prefill: session-affinity
+  decode: session-affinity
+  instances:
+    - name: session-affinity
+      type: session-affinity
+      parameters:
+        # A remembered worker is kept while it has at most this many more
+        # in-flight requests than the least-loaded eligible worker.
+        slack_requests: 4
+        # Sessions remembered per routing partition before LRU eviction.
+        max_sessions: 65536

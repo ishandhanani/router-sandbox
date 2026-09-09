@@ -4,6 +4,7 @@ members = [
     "crates/sticky-until-saturated",
     "crates/sglang-cache-aware",
     "crates/sgl-router-cache-aware",
+    "crates/session-affinity",
 ]
 resolver = "3"
 
