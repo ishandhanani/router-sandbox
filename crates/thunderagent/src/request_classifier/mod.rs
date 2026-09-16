@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use dynamo_kv_router::scheduling::{
+use dynamo_kv_router::plugins::RouterPluginRegistry;
+use dynamo_kv_router::plugins::request_classifier::{
     ClassifierError, ClassifyEvent, ClassifyFuture, ClassifyRequest, RequestClassifier,
     RequestClassifierContext, RequestClassifierFactory, RequestClassifierParameters,
-    RequestClassifierProviderError, RequestClassifierRegistry, RequestClassifierRegistryError,
-    RequestProgress,
+    RequestClassifierProviderError, RequestClassifierRegistryError, RequestProgress,
 };
 use parking_lot::Mutex;
 use thiserror::Error;
@@ -59,9 +59,9 @@ fn classifier_provider(
 }
 
 pub(crate) fn register(
-    registry: &mut RequestClassifierRegistry,
+    registry: &mut RouterPluginRegistry,
 ) -> Result<(), RequestClassifierRegistryError> {
-    registry.register(
+    registry.register_request_classifier(
         crate::THUNDERAGENT_CLASSIFIER_TYPE,
         Arc::new(classifier_provider),
     )
@@ -303,8 +303,8 @@ impl RequestClassifier for ThunderAgentClassifier {
 mod tests {
     use std::time::Duration;
 
+    use dynamo_kv_router::plugins::request_classifier::RequestClassifierWorker;
     use dynamo_kv_router::protocols::WorkerWithDpRank;
-    use dynamo_kv_router::scheduling::RequestClassifierWorker;
 
     use super::scheduler::ProgramLifecycle;
     use super::*;

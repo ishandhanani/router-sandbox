@@ -10,25 +10,15 @@ pub use request_classifier::{
     ThunderAgentClassifier, WorkerCapacityProvider, WorkerCapacitySnapshot,
 };
 
-use dynamo_kv_router::scheduling::{RequestClassifierRegistry, RequestClassifierRegistryError};
-use dynamo_kv_router::services::selection::{
-    WorkerSelectionPolicyRegistry, WorkerSelectionPolicyRegistryError,
-};
+use dynamo_kv_router::plugins::{RouterPluginRegistry, RouterPluginRegistryError};
 
 pub const THUNDERAGENT_CLASSIFIER_TYPE: &str = "thunderagent";
 
-/// Register ThunderAgent's stateless worker-target selector.
-pub fn register(
-    registry: &mut WorkerSelectionPolicyRegistry,
-) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    worker_selection::register(registry)
-}
-
-/// Register ThunderAgent as a statically linked request-classifier plugin.
-pub fn register_request_classifiers(
-    registry: &mut RequestClassifierRegistry,
-) -> Result<(), RequestClassifierRegistryError> {
-    request_classifier::register(registry)
+/// Register ThunderAgent's classifier and worker selector in one plugin catalog.
+pub fn register(registry: &mut RouterPluginRegistry) -> Result<(), RouterPluginRegistryError> {
+    worker_selection::register(registry)?;
+    request_classifier::register(registry)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -37,12 +27,33 @@ mod tests {
 
     #[test]
     fn registers_classifier_and_worker_selector() {
-        let mut worker_registry = WorkerSelectionPolicyRegistry::default();
-        register(&mut worker_registry).unwrap();
-        assert!(!worker_registry.is_empty());
-
-        let mut classifier_registry = RequestClassifierRegistry::default();
-        register_request_classifiers(&mut classifier_registry).unwrap();
-        assert!(!classifier_registry.is_empty());
+        let mut registry = RouterPluginRegistry::default();
+        register(&mut registry).unwrap();
+        let policy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy.path(),
+            r#"
+request_classifier:
+  type: thunderagent
+worker_selection:
+  aggregated: thunderagent
+  instances:
+    - name: thunderagent
+      type: thunderagent
+"#,
+        )
+        .unwrap();
+        let config = dynamo_kv_router::KvRouterConfig {
+            router_policy_config: Some(policy.path().display().to_string()),
+            ..Default::default()
+        };
+        let plugins = registry.resolve_plugins(&config).unwrap();
+        assert!(plugins.worker_selection().is_some());
+        let factory = plugins.request_classifier().unwrap();
+        let context = dynamo_kv_router::plugins::request_classifier::RequestClassifierContext::new(
+            16,
+            Vec::new,
+        );
+        let _classifier = factory(context);
     }
 }

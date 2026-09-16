@@ -3,14 +3,13 @@
 
 use std::sync::Arc;
 
-use dynamo_kv_router::services::selection::{
-    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
-    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
-    WorkerSelectionPolicyRegistryError,
-};
-use dynamo_kv_router::{
+use dynamo_kv_router::WorkerType;
+use dynamo_kv_router::plugins::RouterPluginRegistry;
+use dynamo_kv_router::plugins::worker_selection::{
     WorkerCandidate, WorkerInputView, WorkerInputs, WorkerPicker, WorkerScorer,
-    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError, WorkerType,
+    WorkerSelectionContext, WorkerSelectionPolicy, WorkerSelectionPolicyError,
+    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
+    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistryError,
 };
 
 use crate::{THUNDERAGENT_CLASSIFIER_TYPE, ThunderAgentConfig};
@@ -88,9 +87,9 @@ fn worker_selection_provider(
 }
 
 pub(crate) fn register(
-    registry: &mut WorkerSelectionPolicyRegistry,
+    registry: &mut RouterPluginRegistry,
 ) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    registry.register(
+    registry.register_worker_selection(
         THUNDERAGENT_CLASSIFIER_TYPE,
         Arc::new(worker_selection_provider),
     )
@@ -148,8 +147,8 @@ mod tests {
             policy_class: None,
             session_context: None,
             overlap: OverlapSignals::default(),
-            router_hint_candidates: None,
-            retain_router_hint_chain: false,
+            kv_transfer_candidates: None,
+            retain_kv_transfer_chain: false,
             shared_cache_hits: None,
             worker_loads: Default::default(),
             resp_tx: None,

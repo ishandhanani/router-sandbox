@@ -13,7 +13,7 @@ repository.workspace = true
 bench = []
 
 [dependencies]
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", branch = "main", features = ["standalone-selection"] }
+dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 

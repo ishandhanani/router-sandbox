@@ -2,7 +2,7 @@
 
 `thunderagent-dynamo-policy` implements ThunderAgent's program-aware flow control on Dynamo's asynchronous request-classifier API. It registers a request classifier and a worker-selection policy through Dynamo's statically linked router-plugin catalog; no Python adapter is required.
 
-This prototype is stacked on [ai-dynamo/dynamo#14123](https://github.com/ai-dynamo/dynamo/pull/14123) and its request-classifier catalog follow-up.
+This prototype uses the classifier signals in [ai-dynamo/dynamo#14123](https://github.com/ai-dynamo/dynamo/pull/14123) and the unified plugin catalog in [#14149](https://github.com/ai-dynamo/dynamo/pull/14149). One `register(&mut RouterPluginRegistry)` call registers both roles through `plugins::request_classifier` and `plugins::worker_selection`.
 
 ## Source layout
 
@@ -68,7 +68,7 @@ ThunderAgent computes live used capacity from its own program table. On each rec
 
 The request target is advisory rather than a reservation. Caller constraints and worker liveness remain authoritative, and `Sent` corrects the classifier's accounting if selection falls back.
 
-Completion records Dynamo's terminal input-plus-output context size. The current classifier lifecycle does not expose cumulative streaming context progress, so this crate updates program size only at completion. A final session removes its program when the final request is admitted; completion or abort cannot restore it. A continuing idle program retains its observed assignment for `session_retention_seconds`. Idle retention is pruned lazily on the next classification or periodic reconciliation. The tracking limit also bounds retained programs; at the limit, the oldest idle retained program is evicted before admitting a new session.
+The classifier retains `ClassifyRequest::progress()` and reads its context high-water mark during reconciliation, so pressure decisions account for generation before completion. Dynamo initializes the counter from scheduling input tokens and raises it as the host observes prompt plus generated tokens; this is a logical token estimate, not physical KV occupancy. The handle survives migration retries, and completion records the terminal context size. A final session removes its program when the final request is admitted; completion or abort cannot restore it. A continuing idle program retains its observed assignment for `session_retention_seconds`. Idle retention is pruned lazily on the next classification or periodic reconciliation. The tracking limit also bounds retained programs; at the limit, the oldest idle retained program is evicted before admitting a new session.
 
 ## Configuration
 
