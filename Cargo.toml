@@ -14,4 +14,4 @@ license = "Apache-2.0"
 repository = "https://github.com/ishandhanani/router-sandbox"
 
 [workspace.dependencies]
-dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "ca756b4b208fa919f0860e83922c31b560f477d2" }
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "05747ac66aa745160a8c223683efc4597b4868fb" }
