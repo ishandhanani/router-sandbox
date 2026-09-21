@@ -2,70 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod config;
-mod policy;
-mod selection;
+mod request_classifier;
+mod worker_selection;
 
 pub use config::{ConfigError, ThunderAgentConfig};
-
-use std::sync::Arc;
-
-use dynamo_kv_router::services::selection::{
-    WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
-    WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
-    WorkerSelectionPolicyRegistryError,
+pub use request_classifier::{
+    ThunderAgentClassifier, WorkerCapacityProvider, WorkerCapacitySnapshot,
 };
-use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy};
 
-use selection::SessionAssignments;
-use selection::{ThunderAgentPicker, ThunderAgentScorer};
+use dynamo_kv_router::plugins::{RouterPluginRegistry, RouterPluginRegistryError};
 
-use policy::ThunderAgentPolicy;
+pub const THUNDERAGENT_CLASSIFIER_TYPE: &str = "thunderagent";
 
-/// Build one complete ThunderAgent policy for a Dynamo routing partition.
-pub fn worker_selection_policy(
-    kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
-    config: ThunderAgentConfig,
-) -> Result<WorkerSelectionPolicy, ConfigError> {
-    config.validate()?;
-    Ok(validated_policy(kv_router_config, worker_type, config))
-}
-
-fn validated_policy(
-    kv_router_config: KvRouterConfig,
-    worker_type: &'static str,
-    config: ThunderAgentConfig,
-) -> WorkerSelectionPolicy {
-    let assignments = Arc::new(SessionAssignments::default());
-    let admission = ThunderAgentPolicy::new(config, Arc::clone(&assignments));
-    let scorer = ThunderAgentScorer;
-    let picker = ThunderAgentPicker::new(assignments);
-    WorkerSelectionPolicy::new(
-        kv_router_config,
-        worker_type,
-        vec![Box::new(scorer)],
-        Box::new(picker),
-    )
-    .with_admission_policy(Box::new(admission))
-}
-
-fn provider(
-    parameters: &WorkerSelectionPolicyParameters,
-) -> Result<WorkerSelectionPolicyFactory, WorkerSelectionPolicyProviderError> {
-    let config: ThunderAgentConfig = parameters.deserialize()?;
-    config
-        .validate()
-        .map_err(|error| WorkerSelectionPolicyProviderError::new(error.to_string()))?;
-    Ok(Arc::new(move |router, worker_type, _partition| {
-        validated_policy(router.clone(), worker_type, config.clone())
-    }))
-}
-
-/// Register ThunderAgent under the `thunderagent` worker-selection policy type.
-pub fn register(
-    registry: &mut WorkerSelectionPolicyRegistry,
-) -> Result<(), WorkerSelectionPolicyRegistryError> {
-    registry.register("thunderagent", Arc::new(provider))
+/// Register ThunderAgent's classifier and worker selector in one plugin catalog.
+pub fn register(registry: &mut RouterPluginRegistry) -> Result<(), RouterPluginRegistryError> {
+    worker_selection::register(registry)?;
+    request_classifier::register(registry)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -73,12 +26,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registers_once() {
-        let mut registry = WorkerSelectionPolicyRegistry::default();
+    fn registers_classifier_and_worker_selector() {
+        let mut registry = RouterPluginRegistry::default();
         register(&mut registry).unwrap();
-        assert!(matches!(
-            register(&mut registry),
-            Err(WorkerSelectionPolicyRegistryError::Duplicate { name }) if name == "thunderagent"
-        ));
+        let policy = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            policy.path(),
+            r#"
+request_classifier:
+  type: thunderagent
+worker_selection:
+  aggregated: thunderagent
+  instances:
+    - name: thunderagent
+      type: thunderagent
+"#,
+        )
+        .unwrap();
+        let config = dynamo_kv_router::KvRouterConfig {
+            router_policy_config: Some(policy.path().display().to_string()),
+            ..Default::default()
+        };
+        let plugins = registry.resolve_plugins(&config).unwrap();
+        assert!(plugins.worker_selection().is_some());
+        let factory = plugins.request_classifier().unwrap();
+        let context = dynamo_kv_router::plugins::request_classifier::RequestClassifierContext::new(
+            16,
+            Vec::new,
+        );
+        let _classifier = factory(context);
     }
 }
