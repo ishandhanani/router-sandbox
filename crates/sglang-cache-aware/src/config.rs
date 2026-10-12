@@ -26,6 +26,10 @@ pub struct SglangCacheAwareConfig {
     pub balance_abs_threshold: usize,
     /// Strict active-request-count ratio required for load balancing.
     pub balance_rel_threshold: f64,
+    /// Experimental. When set, skip the router's KV fetch hint unless the fetch adds at least this
+    /// many KV blocks beyond the selected worker's own cached prefix. Unset attaches no fetch
+    /// policy, so Dynamo's default fetch behavior is unchanged.
+    pub kv_fetch_min_blocks: Option<u32>,
 }
 
 impl Default for SglangCacheAwareConfig {
@@ -34,6 +38,7 @@ impl Default for SglangCacheAwareConfig {
             cache_threshold: DEFAULT_CACHE_THRESHOLD,
             balance_abs_threshold: DEFAULT_BALANCE_ABS_THRESHOLD,
             balance_rel_threshold: DEFAULT_BALANCE_REL_THRESHOLD,
+            kv_fetch_min_blocks: None,
         }
     }
 }
@@ -61,6 +66,7 @@ mod tests {
     #[test]
     fn validates_defaults_and_rejects_invalid_values() {
         assert!(SglangCacheAwareConfig::default().validate().is_ok());
+        assert_eq!(SglangCacheAwareConfig::default().kv_fetch_min_blocks, None);
         assert!(
             SglangCacheAwareConfig {
                 cache_threshold: f64::NAN,

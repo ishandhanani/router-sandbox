@@ -10,6 +10,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-dynamo-kv-router = { workspace = true, features = ["standalone-selection"] }
+# The experimental KV fetch-hint API is not on Dynamo main yet. Return to the workspace pin once
+# https://github.com/ai-dynamo/dynamo/pull/15599 merges.
+dynamo-kv-router = { git = "https://github.com/ai-dynamo/dynamo.git", rev = "75b67b6594b7110c6b63216c21a5aef53c9a6eb7", features = ["standalone-selection"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

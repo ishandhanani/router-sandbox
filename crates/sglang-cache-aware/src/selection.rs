@@ -213,6 +213,7 @@ mod tests {
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
+            ..Default::default()
         }
     }
 

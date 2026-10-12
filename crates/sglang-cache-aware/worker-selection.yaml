@@ -9,3 +9,5 @@ worker_selection:
         cache_threshold: 0.3
         balance_abs_threshold: 64
         balance_rel_threshold: 1.5
+        # Experimental. Unset keeps Dynamo's default KV fetch behavior.
+        # kv_fetch_min_blocks: 64
