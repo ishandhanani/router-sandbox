@@ -4,18 +4,21 @@
 //! SGLang's cache-aware, load-gated selection policy using Dynamo worker signals.
 
 mod config;
+mod kv_fetch;
 mod selection;
 
 pub use config::{ConfigError, SglangCacheAwareConfig};
 
 use std::sync::Arc;
 
+use dynamo_kv_router::plugins::worker_selection::experimental::kv_hints::with_kv_transfer_policy;
 use dynamo_kv_router::services::selection::{
     WorkerSelectionPolicyFactory, WorkerSelectionPolicyParameters,
     WorkerSelectionPolicyProviderError, WorkerSelectionPolicyRegistry,
     WorkerSelectionPolicyRegistryError,
 };
 use dynamo_kv_router::{KvRouterConfig, WorkerSelectionPolicy, WorkerType};
+use kv_fetch::MinKvFetch;
 use selection::SglangCacheAwarePicker;
 
 /// Build one SGLang cache-aware policy for a Dynamo routing partition.
@@ -33,12 +36,17 @@ fn validated_policy(
     worker_type: WorkerType,
     config: SglangCacheAwareConfig,
 ) -> WorkerSelectionPolicy {
-    WorkerSelectionPolicy::new(
+    let kv_fetch_min_blocks = config.kv_fetch_min_blocks;
+    let policy = WorkerSelectionPolicy::new(
         kv_router_config,
         worker_type.as_str(),
         Vec::new(),
         Box::new(SglangCacheAwarePicker::new(config)),
-    )
+    );
+    match kv_fetch_min_blocks {
+        Some(min_blocks) => with_kv_transfer_policy(policy, Box::new(MinKvFetch { min_blocks })),
+        None => policy,
+    }
 }
 
 fn provider(
